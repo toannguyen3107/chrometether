@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "chrome-devtools": {
+      "type": "local",
+      "command": [
+        "node",
+        "<PATH_TO_CHROMETETHER>/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js",
+        "--auto-connect"
+      ],
+      "enabled": true
+    },
+    "tether-reader": {
+      "type": "local",
+      "command": [
+        "node",
+        "<PATH_TO_CHROMETETHER>/src/reader-server/index.js"
+      ],
+      "enabled": true
+    }
+  }
+}

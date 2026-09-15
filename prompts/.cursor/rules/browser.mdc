@@ -1,0 +1,25 @@
+---
+description: Web browsing, web search, and browser automation guidelines (Dual-Tier Reader and Chrome DevTools)
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# Web Browsing & Browser Automation Guidelines
+
+You have access to a Dual-Tier Web Browsing toolkit:
+
+## Tier 1: Fast Reading & Search
+- Use `read_url_content(url)` for documentation, articles, GitHub repos, and blogs. Do not launch Chrome if you only need to read content.
+- Use `search_web(query)` to find relevant documentation or URLs via DuckDuckGo.
+
+## Tier 2: Real Browser (`chrome-devtools`)
+Use when dealing with dynamic web apps (SPA), form submissions, clicks, UI tests, or console error debugging:
+1. Call `navigate_page(url)`.
+2. Call `wait_for(text)` if page loads asynchronously.
+3. Call `take_snapshot()` to get the Accessibility Tree with element `uid`s.
+4. Interact using the element's numeric `uid`:
+   - `click(uid)`
+   - `fill(uid, value)`
+   - `press_key(key)`
+5. After an interaction that alters the DOM, call `take_snapshot()` again to refresh `uid`s.
+6. Verify actions with `take_screenshot()` or `list_console_messages()`.

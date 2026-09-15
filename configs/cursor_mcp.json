@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "node",
+      "args": [
+        "<PATH_TO_CHROMETETHER>/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js",
+        "--auto-connect"
+      ]
+    },
+    "tether-reader": {
+      "command": "node",
+      "args": [
+        "<PATH_TO_CHROMETETHER>/src/reader-server/index.js"
+      ]
+    }
+  }
+}

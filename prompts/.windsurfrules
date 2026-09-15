@@ -1,0 +1,9 @@
+<browser_guidelines>
+- When researching documentation or reading articles, always use Tier 1 lightweight tool: `read_url_content(url)` or `search_web(query)`.
+- When interacting with live applications, SPAs, or debugging UI:
+  1. Use `navigate_page(url)` to load the site.
+  2. Use `take_snapshot()` to retrieve the Accessibility Tree.
+  3. Locate the target element and its numeric `uid`.
+  4. Perform actions via `click(uid)` or `fill(uid, value)`.
+  5. Check `take_screenshot()` or `list_console_messages()` to verify UI changes and detect errors.
+</browser_guidelines>

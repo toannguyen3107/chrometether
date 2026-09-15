@@ -1,0 +1,44 @@
+{
+  "name": "chrometether",
+  "version": "1.0.0",
+  "description": "Dual-tier web browsing and live Chrome automation toolkit for AI agents (OpenCode, ZCode, Claude, Cursor) via MCP.",
+  "main": "bin/chrometether.js",
+  "bin": {
+    "chrometether": "./bin/chrometether.js",
+    "agy-browser": "./bin/chrometether.js"
+  },
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/toannguyen3107/chrometether.git"
+  },
+  "scripts": {
+    "start-reader": "node src/reader-server/index.js",
+    "test-reader": "node test/reader-test.js",
+    "test-merger": "node test/merger-test.js",
+    "test": "node bin/test-connection.js",
+    "setup": "node bin/chrometether.js install",
+    "status": "node bin/chrometether.js status"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "browser",
+    "automation",
+    "chrome-devtools",
+    "claude",
+    "cursor",
+    "windsurf",
+    "opencode",
+    "zcode",
+    "agent"
+  ],
+  "author": "Toan Nguyen",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "cheerio": "^1.0.0",
+    "chrome-devtools-mcp": "^1.9.0",
+    "turndown": "^7.2.0"
+  }
+}

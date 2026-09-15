@@ -1,0 +1,9 @@
+# Cursor AI Web Browsing & Automation Rules
+
+When interacting with the web:
+- Tier 1: For reading text, docs, and blogs, use `read_url_content` (lightweight, zero memory). Use `search_web` for internet queries.
+- Tier 2: For dynamic websites and web app testing, use `chrome-devtools`:
+  1. `navigate_page(url)`
+  2. `take_snapshot()` -> Read element numeric `uid`s.
+  3. `click(uid)` or `fill(uid, value)` using `uid`.
+  4. `take_screenshot()` or `list_console_messages()` to inspect results.
