@@ -22,6 +22,7 @@ description: Uses Chrome DevTools via MCP for efficient debugging, troubleshooti
 
 ### Efficient data retrieval
 
+- **Screenshots**: ALWAYS provide the `filePath` parameter for `take_screenshot`. Omitting `filePath` streams large Base64 strings across stdio IPC, which frequently triggers `Tool execution timed out after 30000ms`.
 - Use `filePath` parameter for large outputs (screenshots, snapshots, traces)
 - Use pagination (`pageIdx`, `pageSize`) and filtering (`types`) to minimize data
 - Set `includeSnapshot: false` on input actions unless you need updated page state
@@ -38,9 +39,11 @@ You can send multiple tool calls in parallel, but maintain correct order: naviga
 
 ## Troubleshooting
 
-If `chrome-devtools-mcp` is insufficient, guide users to use Chrome DevTools UI:
-
-- https://developer.chrome.com/docs/devtools
-- https://developer.chrome.com/docs/devtools/ai-assistance
-
-If there are errors launching `chrome-devtools-mcp` or Chrome, refer to https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/main/docs/troubleshooting.md.
+- **Error: `Tool execution timed out after 30000ms`**:
+  1. Ensure you passed `filePath` when taking a screenshot.
+  2. Verify Google Chrome is not minimized to the taskbar. On Windows, minimized windows suspend GPU rendering and CDP screenshot captures hang indefinitely.
+  3. Ensure the page is not blocked by a native modal dialog (`alert()`, `confirm()`, `prompt()`) or pending reCAPTCHA challenge. Use `handle_dialog` if applicable.
+- If `chrome-devtools-mcp` is insufficient, guide users to use Chrome DevTools UI:
+  - https://developer.chrome.com/docs/devtools
+  - https://developer.chrome.com/docs/devtools/ai-assistance
+- If there are errors launching `chrome-devtools-mcp` or Chrome, refer to https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/main/docs/troubleshooting.md.

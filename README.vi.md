@@ -1,4 +1,4 @@
-﻿# 🌐 ChromeTether
+# 🌐 ChromeTether
 
 > **Bộ toolkit duyệt web 2 tầng và điều khiển Chrome trực tiếp cho AI Agent thông qua giao thức MCP (Model Context Protocol).**
 
@@ -6,7 +6,7 @@
 [![Node.js Version](https://img.shields.io/badge/Node.js-%3E%3D18.0.0-green.svg)](https://nodejs.org)
 [![MCP Compatible](https://img.shields.io/badge/MCP-Compatible-orange.svg)](https://modelcontextprotocol.io)
 
-**ChromeTether** mang đến khả năng duyệt web 2 tầng toàn diện cho các AI coding assistant (ZCode, OpenCode, Claude Code, Claude Desktop, Cursor, Windsurf, Cline):
+**ChromeTether** mang đến khả năng duyệt web 2 tầng toàn diện cho các AI coding assistant (ZCode, OpenCode, Claude Code, Claude Desktop, Cursor, Windsurf, Cline, dsh, Antigravity):
 1. **Tầng 1 (Fast Reader)**: Bóc tách nội dung HTML và chuyển sang Markdown siêu nhanh (~150ms, 0MB RAM) phục vụ đọc tài liệu, blog tĩnh và tìm kiếm thông tin không cần bật trình duyệt.
 2. **Tầng 2 (Điều khiển Chrome trực tiếp)**: Kết nối thẳng vào **cửa sổ Google Chrome bạn đang mở** thông qua cờ `--auto-connect` và Chrome DevTools Protocol (CDP). Không mở cửa sổ trình duyệt ảo, giữ nguyên các tab đang mở và toàn bộ phiên đăng nhập của bạn!
 
@@ -79,6 +79,8 @@ node bin/chrometether.js install claude-desktop
 node bin/chrometether.js install cursor
 node bin/chrometether.js install windsurf
 node bin/chrometether.js install cline
+node bin/chrometether.js install dsh
+node bin/chrometether.js install antigravity
 ```
 
 ---

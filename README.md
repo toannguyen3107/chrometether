@@ -1,4 +1,4 @@
-﻿# 🌐 ChromeTether
+# 🌐 ChromeTether
 
 > **Dual-tier web browsing & live Chrome automation toolkit for AI coding assistants and autonomous agents via Model Context Protocol (MCP).**
 
@@ -6,7 +6,7 @@
 [![Node.js Version](https://img.shields.io/badge/Node.js-%3E%3D18.0.0-green.svg)](https://nodejs.org)
 [![MCP Compatible](https://img.shields.io/badge/MCP-Compatible-orange.svg)](https://modelcontextprotocol.io)
 
-**ChromeTether** equips your AI agents (ZCode, OpenCode, Claude Code, Claude Desktop, Cursor, Windsurf, Cline) with a dual-tier web browsing system:
+**ChromeTether** equips your AI agents (ZCode, OpenCode, Claude Code, Claude Desktop, Cursor, Windsurf, Cline, DeepSeek Harness/dsh, Antigravity) with a dual-tier web browsing system:
 1. **Tier 1 (Fast Reader)**: Instant HTTP fetching and Markdown conversion (~150ms, 0MB RAM) for static docs, blogs, and search without starting a browser.
 2. **Tier 2 (Live Chrome Attachment)**: Direct Chrome DevTools Protocol (CDP) control attaching to your **currently open Google Chrome tabs** via `--auto-connect`. No unwanted blank windows, no session loss, and full preservation of your logged-in accounts.
 
@@ -79,6 +79,8 @@ node bin/chrometether.js install claude-desktop
 node bin/chrometether.js install cursor
 node bin/chrometether.js install windsurf
 node bin/chrometether.js install cline
+node bin/chrometether.js install dsh
+node bin/chrometether.js install antigravity
 ```
 
 ---

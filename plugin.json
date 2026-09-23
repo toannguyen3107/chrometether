@@ -1,0 +1,20 @@
+{
+  "name": "agy-browser",
+  "version": "1.0.0",
+  "description": "Antigravity-native dual-tier web browsing and Chrome DevTools automation toolkit via Model Context Protocol (MCP).",
+  "author": {
+    "name": "Toan Nguyen"
+  },
+  "repository": "https://github.com/toannguyen3107/chrometether",
+  "license": "MIT",
+  "keywords": [
+    "antigravity",
+    "chrome",
+    "devtools",
+    "mcp",
+    "puppeteer",
+    "browser",
+    "automation",
+    "web"
+  ]
+}

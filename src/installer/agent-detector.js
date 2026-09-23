@@ -17,13 +17,19 @@ export function detectAgents() {
     if (configExists) {
       try {
         const content = fs.readFileSync(info.configPath, 'utf8');
-        const json = JSON.parse(content);
-        if (
-          (json?.mcpServers && (json.mcpServers['chrome-devtools'] || json.mcpServers['tether-reader'] || json.mcpServers['agy-reader'])) ||
-          (json?.mcp?.servers && (json.mcp.servers['chrome-devtools'] || json.mcp.servers['tether-reader'] || json.mcp.servers['agy-reader'])) ||
-          (json?.mcp && (json.mcp['chrome-devtools'] || json.mcp['tether-reader'] || json.mcp['agy-reader']))
-        ) {
-          isConfigured = true;
+        if (info.id === 'dsh' || info.format === 'dsh') {
+          if (content.includes('mcp-tether-reader') || content.includes('mcp-chrome-devtools')) {
+            isConfigured = true;
+          }
+        } else {
+          const json = JSON.parse(content);
+          if (
+            (json?.mcpServers && (json.mcpServers['chrome-devtools'] || json.mcpServers['tether-reader'] || json.mcpServers['agy-reader'])) ||
+            (json?.mcp?.servers && (json.mcp.servers['chrome-devtools'] || json.mcp.servers['tether-reader'] || json.mcp.servers['agy-reader'])) ||
+            (json?.mcp && (json.mcp['chrome-devtools'] || json.mcp['tether-reader'] || json.mcp['agy-reader']))
+          ) {
+            isConfigured = true;
+          }
         }
       } catch {
         // ignore parse error
@@ -31,10 +37,7 @@ export function detectAgents() {
     }
 
     results.push({
-      id: info.id,
-      name: info.name,
-      configPath: info.configPath,
-      appDir: info.appDir,
+      ...info,
       isDetected: appDirExists || configExists,
       configExists,
       isConfigured,

@@ -85,5 +85,22 @@ export function getAgentPaths() {
       skillsDir: path.join(home, '.zcode', 'skills'),
       agentsMd: path.join(home, '.zcode', 'AGENTS.md')
     },
+    antigravity: {
+      name: 'Google Antigravity (AGY)',
+      id: 'antigravity',
+      format: 'antigravity-plugin',
+      configPath: path.join(home, '.gemini', 'config', 'plugins', 'agy-browser', 'plugin.json'),
+      appDir: path.join(home, '.gemini', 'antigravity'),
+      pluginsDir: path.join(home, '.gemini', 'config', 'plugins', 'agy-browser'),
+    },
+    dsh: {
+      name: 'DeepSeek Harness (dsh)',
+      id: 'dsh',
+      format: 'dsh',
+      configPath: path.join(home, '.dsh', 'profiles', 'web', 'cordis.patch.yml'),
+      appDir: path.join(home, '.dsh'),
+      skillsDir: path.join(home, '.dsh', 'skills'),
+      agentsMd: path.join(home, '.dsh', 'AGENTS.md')
+    },
   };
 }

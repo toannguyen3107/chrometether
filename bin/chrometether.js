@@ -24,7 +24,7 @@ Usage:
 Commands:
   status               Check detected agents and their MCP configuration status
   install [agent]      Install/merge MCP configuration into agents (default: all detected)
-                       Supported: all, zcode, opencode, claude-code, claude-desktop, cursor, windsurf, roo-code, cline
+                       Supported: all, zcode, opencode, claude-code, claude-desktop, cursor, windsurf, roo-code, cline, antigravity, dsh
   test                 Run full diagnostics and health check
   start-reader         Start the Tier 1 Reader MCP server on stdio
   help                 Display this help information
@@ -82,6 +82,117 @@ function handleInstall(targetAgent = 'all') {
 
   targets.forEach(agent => {
     console.log(`Installing into ${agent.name}...`);
+    if (agent.id === 'antigravity') {
+      try {
+        const dest = agent.pluginsDir;
+        if (!fs.existsSync(dest)) {
+          fs.mkdirSync(dest, { recursive: true });
+        }
+        fs.copyFileSync(path.join(projectDir, 'plugin.json'), path.join(dest, 'plugin.json'));
+        const mcpConfig = {
+          mcpServers: {
+            "tether-reader": {
+              command: "node",
+              args: [path.join(projectDir, 'src', 'reader-server', 'index.js')]
+            },
+            "chrome_devtools": {
+              command: "npx",
+              args: ["-y", "chrome-devtools-mcp@latest", "--auto-connect"]
+            }
+          }
+        };
+        fs.writeFileSync(path.join(dest, 'mcp_config.json'), JSON.stringify(mcpConfig, null, 2), 'utf8');
+        const destRules = path.join(dest, 'rules');
+        if (!fs.existsSync(destRules)) fs.mkdirSync(destRules, { recursive: true });
+        fs.copyFileSync(path.join(projectDir, 'rules', 'AGENTS.md'), path.join(destRules, 'AGENTS.md'));
+        const destSkills = path.join(dest, 'skills');
+        if (!fs.existsSync(destSkills)) fs.mkdirSync(destSkills, { recursive: true });
+        fs.cpSync(path.join(projectDir, 'skills'), destSkills, { recursive: true });
+
+        console.log(`  ✔ Successfully installed Antigravity plugin! Directory: ${dest}`);
+        console.log(`  ✔ Registered Antigravity components: plugin.json, mcp_config.json, rules/AGENTS.md, skills/\n`);
+        return;
+      } catch (err) {
+        console.error(`  ❌ Failed to install Antigravity plugin: ${err.message}\n`);
+        return;
+      }
+    }
+
+    if (agent.id === 'dsh') {
+      try {
+        const patchPath = agent.configPath;
+        const patchDir = path.dirname(patchPath);
+        if (!fs.existsSync(patchDir)) {
+          fs.mkdirSync(patchDir, { recursive: true });
+        }
+
+        const nodeExe = process.execPath.replace(/\\/g, '/');
+        const tetherReaderScript = path.join(projectDir, 'src', 'reader-server', 'index.js').replace(/\\/g, '/');
+        const chromeDevtoolsScript = path.join(projectDir, 'node_modules', 'chrome-devtools-mcp', 'build', 'src', 'bin', 'chrome-devtools.js').replace(/\\/g, '/');
+        const projectDirFwd = projectDir.replace(/\\/g, '/');
+
+        const dshSnippet = `    - id: mcp-tether-reader
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: tether_reader
+        transport: stdio
+        command: ${nodeExe}
+        args:
+          - ${tetherReaderScript}
+        cwd: ${projectDirFwd}
+    - id: mcp-chrome-devtools
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: chrome_devtools
+        transport: stdio
+        command: ${nodeExe}
+        args:
+          - ${chromeDevtoolsScript}
+          - --auto-connect
+        cwd: ${projectDirFwd}\n`;
+
+        let content = '';
+        if (fs.existsSync(patchPath)) {
+          content = fs.readFileSync(patchPath, 'utf8');
+        } else {
+          content = '# dsh profile patch\n- insert:\n';
+        }
+
+        if (!content.includes('mcp-tether-reader') && !content.includes('mcp-chrome-devtools')) {
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+          fs.writeFileSync(`${patchPath}.${timestamp}.bak`, content, 'utf8');
+
+          if (content.includes('- insert:')) {
+            content = content.replace(/- insert:\r?\n/, `- insert:\n${dshSnippet}`);
+          } else {
+            content += `\n- insert:\n${dshSnippet}`;
+          }
+          fs.writeFileSync(patchPath, content, 'utf8');
+        }
+
+        const localSkillsDir = path.join(projectDir, 'skills');
+        if (agent.skillsDir && fs.existsSync(localSkillsDir)) {
+          if (!fs.existsSync(agent.skillsDir)) {
+            fs.mkdirSync(agent.skillsDir, { recursive: true });
+          }
+          fs.cpSync(localSkillsDir, agent.skillsDir, { recursive: true });
+        }
+
+        const localAgentsMd = path.join(projectDir, 'AGENTS.md');
+        if (agent.agentsMd && fs.existsSync(localAgentsMd) && !fs.existsSync(agent.agentsMd)) {
+          fs.copyFileSync(localAgentsMd, agent.agentsMd);
+        }
+
+        console.log(`  ✔ Successfully configured DeepSeek Harness (dsh)! File: ${patchPath}`);
+        console.log(`  ✔ Copied browser skills to: ${agent.skillsDir}`);
+        console.log(`  ✔ Set up agent instructions in: ${agent.agentsMd}\n`);
+        return;
+      } catch (err) {
+        console.error(`  ❌ Failed to configure DeepSeek Harness (dsh): ${err.message}\n`);
+        return;
+      }
+    }
+
     let serverConfigs = configs;
     let format = 'standard';
     if (agent.id === 'opencode' || agent.format === 'opencode') {
@@ -160,6 +271,7 @@ function handleInstall(targetAgent = 'all') {
   console.log('  - For OpenCode:  Copy prompts/AGENTS.md into your project (or ~/.config/opencode/AGENTS.md)');
   console.log('  - For Cursor:    Copy prompts/.cursor/rules/browser.mdc into your project');
   console.log('  - For Windsurf:  Copy prompts/.windsurfrules into your project');
+  console.log('  - For DSH:       Installed in ~/.dsh/profiles/web/cordis.patch.yml, ~/.dsh/skills, ~/.dsh/AGENTS.md');
   console.log('  - For Codex/All: Copy prompts/AGENTS.md into your project\n');
 }
 
