@@ -128,7 +128,7 @@ function handleInstall(targetAgent = 'all') {
 
         const nodeExe = process.execPath.replace(/\\/g, '/');
         const tetherReaderScript = path.join(projectDir, 'src', 'reader-server', 'index.js').replace(/\\/g, '/');
-        const chromeDevtoolsScript = path.join(projectDir, 'node_modules', 'chrome-devtools-mcp', 'build', 'src', 'bin', 'chrome-devtools.js').replace(/\\/g, '/');
+        const chromeDevtoolsScript = path.join(projectDir, 'node_modules', 'chrome-devtools-mcp', 'build', 'src', 'bin', 'chrome-devtools-mcp.js').replace(/\\/g, '/');
         const projectDirFwd = projectDir.replace(/\\/g, '/');
 
         const dshSnippet = `    - id: mcp-tether-reader
