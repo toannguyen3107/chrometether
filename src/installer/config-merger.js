@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { parseJsonc } from './jsonc.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,6 +16,7 @@ const DEFAULT_PROJECT_DIR = path.resolve(__dirname, '..', '..');
 export function getBrowserMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
   const normalizedProjectDir = path.resolve(projectDir);
   const readerScript = path.join(normalizedProjectDir, 'src', 'reader-server', 'index.js');
+  const mapScript = path.join(normalizedProjectDir, 'src', 'app-map', 'server.js');
   const chromeDevToolsScript = path.join(
     normalizedProjectDir,
     'node_modules',
@@ -38,6 +40,10 @@ export function getBrowserMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
       args: [
         readerScript
       ]
+    },
+    'tether-map': {
+      command: 'node',
+      args: [mapScript]
     }
   };
 }
@@ -50,6 +56,7 @@ export function getBrowserMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
 export function getOpenCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
   const normalizedProjectDir = path.resolve(projectDir);
   const readerScript = path.join(normalizedProjectDir, 'src', 'reader-server', 'index.js');
+  const mapScript = path.join(normalizedProjectDir, 'src', 'app-map', 'server.js');
   const chromeDevToolsScript = path.join(
     normalizedProjectDir,
     'node_modules',
@@ -76,6 +83,11 @@ export function getOpenCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
         'node',
         readerScript
       ],
+      enabled: true
+    },
+    'tether-map': {
+      type: 'local',
+      command: ['node', mapScript],
       enabled: true
     }
   };
@@ -89,6 +101,7 @@ export function getOpenCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
 export function getZCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
   const normalizedProjectDir = path.resolve(projectDir);
   const readerScript = path.join(normalizedProjectDir, 'src', 'reader-server', 'index.js');
+  const mapScript = path.join(normalizedProjectDir, 'src', 'app-map', 'server.js');
   const chromeDevToolsScript = path.join(
     normalizedProjectDir,
     'node_modules',
@@ -114,6 +127,11 @@ export function getZCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
       args: [
         readerScript
       ]
+    },
+    'tether-map': {
+      type: 'stdio',
+      command: 'node',
+      args: [mapScript]
     }
   };
 }
@@ -150,40 +168,37 @@ export function mergeMcpConfig(configFilePath, serversToMerge, format = 'standar
     if (fs.existsSync(configFilePath)) {
       const raw = fs.readFileSync(configFilePath, 'utf8');
       try {
-        currentConfig = JSON.parse(raw);
-        if (isZCode) {
-          if (!currentConfig.mcp || typeof currentConfig.mcp !== 'object') {
-            currentConfig.mcp = {};
-          }
-          if (!currentConfig.mcp.servers || typeof currentConfig.mcp.servers !== 'object') {
-            currentConfig.mcp.servers = {};
-          }
-        } else if (isOpenCode) {
-          if (!currentConfig.mcp || typeof currentConfig.mcp !== 'object') {
-            currentConfig.mcp = {};
-          }
-        } else {
-          if (!currentConfig.mcpServers || typeof currentConfig.mcpServers !== 'object') {
-            currentConfig.mcpServers = {};
-          }
-        }
-
-        // Create backup
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        backupFile = `${configFilePath}.${timestamp}.bak`;
-        fs.writeFileSync(backupFile, raw, 'utf8');
+        currentConfig = isOpenCode ? parseJsonc(raw) : JSON.parse(raw);
       } catch (parseErr) {
-        // If file is corrupted or empty, back it up and start fresh
-        backupFile = `${configFilePath}.corrupted.bak`;
-        fs.writeFileSync(backupFile, raw, 'utf8');
-        if (isZCode) {
-          currentConfig = { mcp: { servers: {} } };
-        } else if (isOpenCode) {
-          currentConfig = { "$schema": "https://opencode.ai/config.json", mcp: {} };
-        } else {
-          currentConfig = { mcpServers: {} };
+        throw new Error(`Cannot parse existing config: ${parseErr.message}. The file was not changed.`);
+      }
+      if (!currentConfig || typeof currentConfig !== 'object' || Array.isArray(currentConfig)) {
+        throw new Error('Existing config must be a JSON object. The file was not changed.');
+      }
+      if (isZCode) {
+        if (currentConfig.mcp === undefined) currentConfig.mcp = {};
+        else if (!currentConfig.mcp || typeof currentConfig.mcp !== 'object' || Array.isArray(currentConfig.mcp)) {
+          throw new Error('Existing mcp setting must be an object. The file was not changed.');
+        }
+        if (currentConfig.mcp.servers === undefined) currentConfig.mcp.servers = {};
+        else if (!currentConfig.mcp.servers || typeof currentConfig.mcp.servers !== 'object' || Array.isArray(currentConfig.mcp.servers)) {
+          throw new Error('Existing mcp.servers setting must be an object. The file was not changed.');
+        }
+      } else if (isOpenCode) {
+        if (currentConfig.mcp === undefined) currentConfig.mcp = {};
+        else if (!currentConfig.mcp || typeof currentConfig.mcp !== 'object' || Array.isArray(currentConfig.mcp)) {
+          throw new Error('Existing mcp setting must be an object. The file was not changed.');
+        }
+      } else {
+        if (currentConfig.mcpServers === undefined) currentConfig.mcpServers = {};
+        else if (!currentConfig.mcpServers || typeof currentConfig.mcpServers !== 'object' || Array.isArray(currentConfig.mcpServers)) {
+          throw new Error('Existing mcpServers setting must be an object. The file was not changed.');
         }
       }
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      backupFile = `${configFilePath}.${timestamp}.bak`;
+      fs.writeFileSync(backupFile, raw, 'utf8');
     }
 
     // Merge servers without removing existing ones

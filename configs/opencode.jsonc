@@ -17,6 +17,14 @@
         "<PATH_TO_CHROMETETHER>/src/reader-server/index.js"
       ],
       "enabled": true
+    },
+    "tether-map": {
+      "type": "local",
+      "command": [
+        "node",
+        "<PATH_TO_CHROMETETHER>/src/app-map/server.js"
+      ],
+      "enabled": true
     }
   }
 }

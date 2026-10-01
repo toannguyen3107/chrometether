@@ -16,13 +16,13 @@
 
 ```mermaid
 flowchart TD
-    User["Yêu cầu duyệt web của bạn"] --> Agent["AI Agent (ZCode, OpenCode, Claude, Cursor)"]
-    Agent --> Decision{"Mục tiêu tác vụ?"}
+    User["Your web request"] --> Agent["AI Agent (ZCode, OpenCode, Claude, Cursor)"]
+    Agent --> Decision{"Task type?"}
     
-    Decision -- "Đọc tài liệu, blog, GitHub, tìm kiếm web" --> Tier1["Tầng 1: Fast Reader (tether-reader)"]
+    Decision -- "Docs, blogs, GitHub, web search" --> Tier1["Tier 1: Fast Reader (tether-reader)"]
     Tier1 --> Res1["HTTP GET + Cheerio + Turndown\n(~150ms, 0MB RAM Chrome)"]
     
-    Decision -- "Web động (SPA), điền form, click, tab thật, debug" --> Tier2["Tầng 2: Chrome trực tiếp (chrome-devtools)"]
+    Decision -- "Dynamic sites, forms, clicks, debugging" --> Tier2["Tier 2: Live Chrome (chrome-devtools)"]
     Tier2 --> Res2["Chrome DevTools Protocol (CDP)\n(Accessibility Tree UID, Screenshots, Network, Console)"]
 ```
 
@@ -41,8 +41,21 @@ Khác với các công cụ thông thường bật ra một trình duyệt trắ
 
 ### 3. Tương tác chính xác qua Accessibility Tree `uid`
 * Không gây tràn token do nhồi nhét mã HTML thô.
-* Dùng cây trợ năng (Accessibility Tree) của Chrome, mỗi phần tử tương tác được đánh số `uid` (ví dụ: `[uid: 10] button "Đăng nhập"`).
+* Dùng cây trợ năng (Accessibility Tree) của Chrome, mỗi phần tử tương tác được đánh số `uid` (ví dụ: `[uid: 10] button "Log in"`).
 * AI tương tác chính xác 100%: `fill(14, "email@example.com")` và `click(10)`.
+
+### 4. Bản đồ ứng dụng (`tether-map`)
+
+Trình cài đặt đăng ký thêm MCP server `tether-map`. Khi agent khảo sát ứng dụng trong Chrome, server này lưu các trang đã đi qua và gom request theo phương thức cùng mẫu đường dẫn. Ví dụ, hai request `GET /api/orders/123` và `GET /api/orders/456` được gom thành `GET /api/orders/{id}`. Bản đồ cũng ghi mã trạng thái, **tên** tham số truy vấn và trang nơi request xuất hiện.
+
+Bạn có thể yêu cầu: **“Hãy lập bản đồ các trang và API quan sát được khi khảo sát https://app.example.com.”** Quy trình:
+
+1. Gọi `start_app_map(target_url)`; thêm `allowed_origins` nếu ứng dụng dùng API ở origin riêng.
+2. Duyệt bằng `chrome-devtools`, rồi gọi `record_app_page(page_url, title)` cho từng trang đã ghé thăm.
+3. Gọi `list_network_requests({includePreservedRequests: true})` để giữ các request qua lần chuyển trang, rồi chuyển URL, phương thức, mã trạng thái và loại tài nguyên sang `record_app_requests(page_url, requests)`. Mỗi lần gọi nhận tối đa 200 request.
+4. Gọi `get_app_map({kind: "api"})` để xem các endpoint API. Dùng `page_offset`, `endpoint_offset` và `limit` để phân trang kết quả.
+
+Phiên bản này cần agent chuyển thông tin request sang `tether-map`; server chưa tự chặn hay ghi toàn bộ lưu lượng Chrome. Chỉ các origin được khai báo được ghi nhận. Body, header, cookie, giá trị query và fragment không được lưu. File mặc định là `~/.chrometether/app-map.json`; có thể đổi bằng biến môi trường `CHROMETETHER_MAP_FILE`. Gọi `start_app_map` sẽ thay bản đồ cũ trong file đó.
 
 ---
 
@@ -65,13 +78,13 @@ git clone https://github.com/toannguyen3107/chrometether.git
 cd chrometether
 npm install
 
-# Kiểm tra trạng thái các agent trên máy
+# Check installed agents
 node bin/chrometether.js status
 
-# Tự động cấu hình toàn bộ các agent được tìm thấy
+# Configure all detected agents
 node bin/chrometether.js install all
 
-# Hoặc cài riêng cho từng agent cụ thể
+# Or install for a specific agent
 node bin/chrometether.js install zcode
 node bin/chrometether.js install opencode
 node bin/chrometether.js install claude-code
@@ -106,7 +119,7 @@ chrome.exe --remote-debugging-port=9222
 
 | Agent | File cấu hình | Tính năng được tích hợp |
 | :--- | :--- | :--- |
-| **ZCode (Z.ai)** | `~/.zcode/cli/config.json` | Tự động đăng ký MCP `chrome-devtools` & `tether-reader`. Tích hợp sẵn lệnh `/browser` trong `~/.zcode/commands/` và bộ 5 skills chính thức trong `~/.zcode/skills/`. |
+| **ZCode (Z.ai)** | `~/.zcode/cli/config.json` | Đăng ký `chrome-devtools`, `tether-reader` và `tether-map`. Cài lệnh `/browser` cùng bộ browser skills. |
 | **OpenCode CLI** | `~/.config/opencode/opencode.jsonc` | Tự động merge theo chuẩn mảng `command` của OpenCode với `--auto-connect`. |
 | **Claude Code CLI** | `~/.claude.json` | Cấu hình MCP + tự động sao chép skills vào `~/.claude/skills/`. |
 | **Claude Desktop** | `claude_desktop_config.json` | Tự động merge cấu hình stdio MCP. |
@@ -126,7 +139,10 @@ Bộ test sẽ xác minh:
 * Khả năng chuyển đổi HTML sang Markdown của Fast Reader.
 * Tìm kiếm DuckDuckGo không cần API key.
 * Kết nối JSON-RPC chuẩn MCP của `tether-reader`.
+* Kết nối JSON-RPC chuẩn MCP của `tether-map`.
 * Khả năng khởi động Stdio MCP của `chrome-devtools`.
+
+Chạy `npm run test-map` để kiểm tra bản đồ ứng dụng không cần mạng và `npm run test-merger` để kiểm tra cấu hình installer.
 
 ---
 

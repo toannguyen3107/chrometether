@@ -33,3 +33,7 @@ Use the Chrome DevTools MCP tools when the target site is dynamic (React/Next.js
    - `take_screenshot()`: Verify visual UI changes.
    - `list_console_messages()`: Check for JavaScript errors or warnings.
    - `list_network_requests()`: Verify backend API request/response statuses.
+
+## Application mapping
+
+For application exploration, use `start_app_map` with the target URL, then `record_app_page` for each page visited in Chrome. After `list_network_requests`, pass only observed URL, method, status, and resource type to `record_app_requests`. Use `get_app_map` to review grouped endpoints and coverage. The map records supplied observations; it does not capture traffic automatically.

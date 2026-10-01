@@ -44,6 +44,19 @@ Unlike other tools that spawn isolated, blank browser profiles every time, Chrom
 * Uses Chrome's **Accessibility Tree** where every interactive button, input, and link is assigned a numeric `uid` (e.g. `[uid: 10] button "Submit"`).
 * The AI interacts with 100% precision: `fill(14, "value")` and `click(10)`.
 
+### 4. Application Map (`tether-map`)
+
+The installer also registers `tether-map`, a local MCP server for building a reusable map of an application while an agent explores it in Chrome. It groups observed requests by method and URL path (for example, `/api/orders/123` and `/api/orders/456` become `GET /api/orders/{id}`), then records status codes, query parameter **names**, and the page where each endpoint was seen.
+
+Ask your agent: **“Map the pages and API requests you observe while exploring https://app.example.com.”** The workflow is:
+
+1. `start_app_map(target_url)`; include `allowed_origins` if the application uses a separate API origin.
+2. Navigate with `chrome-devtools`, then call `record_app_page(page_url, title)` for visited pages.
+3. Call Chrome DevTools `list_network_requests({includePreservedRequests: true})` and pass the observed URL, method, status, and resource type to `record_app_requests(page_url, requests)`. Calls accept up to 200 requests.
+4. Call `get_app_map({kind: "api"})` to focus on API endpoints. Use `endpoint_offset`, `page_offset`, and `limit` to page through the saved map (50 items per group by default, at most 100).
+
+This first version relies on the agent to pass Chrome observations to `tether-map`; it does not intercept traffic automatically. Only explicitly allowed origins are recorded. Request bodies, headers, cookies, URL query values, and fragments are not saved. The map defaults to `~/.chrometether/app-map.json` (override with `CHROMETETHER_MAP_FILE` before starting the MCP server). `start_app_map` replaces the existing map at that path.
+
 ---
 
 ## 🚀 1-Click Installation
@@ -106,7 +119,7 @@ chrome.exe --remote-debugging-port=9222
 
 | Agent | Config File | Features Added |
 | :--- | :--- | :--- |
-| **ZCode (Z.ai)** | `~/.zcode/cli/config.json` | Registers `chrome-devtools` & `tether-reader`. Installs `/browser` slash command in `~/.zcode/commands/` and official browser skills in `~/.zcode/skills/`. |
+| **ZCode (Z.ai)** | `~/.zcode/cli/config.json` | Registers `chrome-devtools`, `tether-reader`, and `tether-map`. Installs `/browser` slash command and browser skills. |
 | **OpenCode CLI** | `~/.config/opencode/opencode.jsonc` | Merged using OpenCode MCP array schema with `--auto-connect`. |
 | **Claude Code CLI** | `~/.claude.json` | MCP configuration + installs browser skills in `~/.claude/skills/`. |
 | **Claude Desktop** | `claude_desktop_config.json` | MCP configuration with `--auto-connect`. |
@@ -126,7 +139,10 @@ Tests:
 * Fast Reader HTML-to-Markdown conversion.
 * DuckDuckGo organic search without API keys.
 * `tether-reader` Stdio MCP protocol initialization.
+* `tether-map` Stdio MCP protocol initialization.
 * `chrome-devtools` Stdio MCP protocol initialization.
+
+Run `npm run test-map` for the offline application-map tests and `npm run test-merger` for installer configuration tests.
 
 ---
 

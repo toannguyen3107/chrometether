@@ -35,3 +35,7 @@ Use the Chrome DevTools MCP tools when the target site is dynamic (React/Next.js
      > Keep the Google Chrome window visible or unminimized; minimized windows trigger OS GPU rendering throttling and CDP timeouts.
    - `list_console_messages()`: Check for JavaScript errors or warnings.
    - `list_network_requests()`: Verify backend API request/response statuses.
+
+## Application mapping
+
+When asked to map an application, use the `application-mapping` skill and the `tether-map` MCP tools. Start a map for the target origin, record each visited page, pass observed Chrome network request metadata to `record_app_requests`, and finish with `get_app_map`. Only include additional API origins when they belong to the requested application.

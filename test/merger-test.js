@@ -49,7 +49,7 @@ function runMergerTest() {
     process.exit(1);
   }
 
-  if (!updated.mcpServers['chrome-devtools'] || !updated.mcpServers['tether-reader']) {
+  if (!updated.mcpServers['chrome-devtools'] || !updated.mcpServers['tether-reader'] || !updated.mcpServers['tether-map']) {
     console.error('❌ New servers were not added properly!');
     process.exit(1);
   }
@@ -60,7 +60,7 @@ function runMergerTest() {
   }
 
   console.log('✔ Existing servers preserved: my_custom_db');
-  console.log('✔ Added servers: chrome-devtools, tether-reader');
+  console.log('✔ Added servers: chrome-devtools, tether-reader, tether-map');
   console.log('✔ Backup file created at:', mergeResult.backupFile);
   console.log('✔ Safe JSON merge PASSED!\n');
 

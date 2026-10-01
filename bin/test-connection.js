@@ -110,7 +110,18 @@ async function runHealthCheck() {
     console.error(`❌ tether-reader MCP: FAILED (${err.message})`);
   }
 
-  // 3. Test Tier 2 Chrome DevTools MCP Stdio Transport
+  // 3. Test application map MCP Stdio Transport
+  console.log('\n--- Checking Application Map MCP Server ---');
+  try {
+    const mapScript = path.resolve('src/app-map/server.js');
+    const res = await testMcpServer('node', [mapScript], 'tether-map MCP');
+    console.log(`✔ tether-map Stdio MCP: OK (Protocol ${res.result.protocolVersion || 'v1'})`);
+  } catch (err) {
+    allPassed = false;
+    console.error(`❌ tether-map MCP: FAILED (${err.message})`);
+  }
+
+  // 4. Test Tier 2 Chrome DevTools MCP Stdio Transport
   console.log('\n--- Checking Tier 2 Chrome DevTools MCP Engine ---');
   try {
     const devToolsScript = path.resolve('node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js');

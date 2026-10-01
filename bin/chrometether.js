@@ -95,6 +95,10 @@ function handleInstall(targetAgent = 'all') {
               command: "node",
               args: [path.join(projectDir, 'src', 'reader-server', 'index.js')]
             },
+            "tether-map": {
+              command: "node",
+              args: [path.join(projectDir, 'src', 'app-map', 'server.js')]
+            },
             "chrome_devtools": {
               command: "npx",
               args: ["-y", "chrome-devtools-mcp@latest", "--auto-connect"]
@@ -128,8 +132,19 @@ function handleInstall(targetAgent = 'all') {
 
         const nodeExe = process.execPath.replace(/\\/g, '/');
         const tetherReaderScript = path.join(projectDir, 'src', 'reader-server', 'index.js').replace(/\\/g, '/');
+        const tetherMapScript = path.join(projectDir, 'src', 'app-map', 'server.js').replace(/\\/g, '/');
         const chromeDevtoolsScript = path.join(projectDir, 'node_modules', 'chrome-devtools-mcp', 'build', 'src', 'bin', 'chrome-devtools-mcp.js').replace(/\\/g, '/');
         const projectDirFwd = projectDir.replace(/\\/g, '/');
+
+        const dshMapSnippet = `    - id: mcp-tether-map
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: tether_map
+        transport: stdio
+        command: ${nodeExe}
+        args:
+          - ${tetherMapScript}
+        cwd: ${projectDirFwd}\n`;
 
         const dshSnippet = `    - id: mcp-tether-reader
       name: '@deepseek-ai/dsh-mcp-client'
@@ -149,7 +164,8 @@ function handleInstall(targetAgent = 'all') {
         args:
           - ${chromeDevtoolsScript}
           - --auto-connect
-        cwd: ${projectDirFwd}\n`;
+        cwd: ${projectDirFwd}
+${dshMapSnippet}`;
 
         let content = '';
         if (fs.existsSync(patchPath)) {
@@ -158,14 +174,17 @@ function handleInstall(targetAgent = 'all') {
           content = '# dsh profile patch\n- insert:\n';
         }
 
-        if (!content.includes('mcp-tether-reader') && !content.includes('mcp-chrome-devtools')) {
+        if (!content.includes('mcp-tether-map')) {
           const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
           fs.writeFileSync(`${patchPath}.${timestamp}.bak`, content, 'utf8');
 
+          const snippet = content.includes('mcp-tether-reader') || content.includes('mcp-chrome-devtools')
+            ? dshMapSnippet
+            : dshSnippet;
           if (content.includes('- insert:')) {
-            content = content.replace(/- insert:\r?\n/, `- insert:\n${dshSnippet}`);
+            content = content.replace(/- insert:\r?\n/, `- insert:\n${snippet}`);
           } else {
-            content += `\n- insert:\n${dshSnippet}`;
+            content += `\n- insert:\n${snippet}`;
           }
           fs.writeFileSync(patchPath, content, 'utf8');
         }

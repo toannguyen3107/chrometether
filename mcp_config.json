@@ -6,6 +6,12 @@
         "src/reader-server/index.js"
       ]
     },
+    "tether-map": {
+      "command": "node",
+      "args": [
+        "src/app-map/server.js"
+      ]
+    },
     "chrome_devtools": {
       "command": "npx",
       "args": [

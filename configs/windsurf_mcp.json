@@ -12,6 +12,12 @@
       "args": [
         "<PATH_TO_CHROMETETHER>/src/reader-server/index.js"
       ]
+    },
+    "tether-map": {
+      "command": "node",
+      "args": [
+        "<PATH_TO_CHROMETETHER>/src/app-map/server.js"
+      ]
     }
   }
 }

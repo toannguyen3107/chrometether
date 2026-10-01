@@ -24,3 +24,7 @@ Use the Chrome DevTools MCP tools when the page is a dynamic Single Page App (Re
    - `take_screenshot()`: Capture visual state for UI inspection.
    - `list_console_messages()`: Verify no uncaught JavaScript errors or network failures.
    - `list_network_requests()`: Verify API responses (HTTP 200/404/500).
+
+## Application mapping
+
+When exploring an application, start `tether-map` with `start_app_map(target_url)`. Record each visited page with `record_app_page`, then pass the request metadata observed through Chrome DevTools `list_network_requests` to `record_app_requests`. Call `get_app_map` to review the persistent page and endpoint map. Include only origins within the requested application.
