@@ -497,7 +497,8 @@ export class ContainerVault {
         action: { type: 'block' },
         condition: {
           tabIds: [numericTabId],
-          urlFilter: '*'
+          urlFilter: '*',
+          excludedResourceTypes: []
         }
       });
       return rules;
@@ -505,6 +506,7 @@ export class ContainerVault {
 
     // Rule 1: Always strip `Set-Cookie` from responses on this container tab so Chrome's
     // default cookie jar is never polluted (Fixes B1).
+    // Note: `excludedResourceTypes: []` is mandatory in Chrome DNR so `main_frame` is included!
     rules.push({
       id: baseRuleId + 1,
       priority: 100,
@@ -513,7 +515,8 @@ export class ContainerVault {
         responseHeaders: [{ header: 'set-cookie', operation: 'remove' }]
       },
       condition: {
-        tabIds: [numericTabId]
+        tabIds: [numericTabId],
+        excludedResourceTypes: []
       }
     });
 
@@ -527,7 +530,8 @@ export class ContainerVault {
         requestHeaders: [{ header: 'cookie', operation: 'remove' }]
       },
       condition: {
-        tabIds: [numericTabId]
+        tabIds: [numericTabId],
+        excludedResourceTypes: []
       }
     });
 
@@ -557,7 +561,8 @@ export class ContainerVault {
 
       const condition = {
         tabIds: [numericTabId],
-        requestDomains: [domain]
+        requestDomains: [domain],
+        excludedResourceTypes: []
       };
       if (allSecure) {
         condition.urlFilter = '|https*';
@@ -619,11 +624,24 @@ export class ContainerVault {
   if (window.__chrometetherContainerInitialized) return;
   Object.defineProperty(window, '__chrometetherContainerInitialized', { value: true, configurable: false });
 
+  // Capture primordial intrinsics and remove the global CDP binding so untrusted page scripts
+  // cannot invoke window.__chrometether_vault_sync directly or tamper with prototypes.
+  const JSONStringify = JSON.stringify;
+  const ObjectKeys = Object.keys;
+  const ObjectHasOwn = Object.prototype.hasOwnProperty;
+  const rawSyncBinding = typeof window.__chrometether_vault_sync === 'function'
+    ? window.__chrometether_vault_sync
+    : null;
+  try {
+    delete window.__chrometether_vault_sync;
+  } catch {}
+
   const state = ${initialPayload};
   const notifyHub = (payload) => {
     try {
-      if (typeof window.__chrometether_vault_sync === 'function') {
-        window.__chrometether_vault_sync(JSON.stringify({ container: state.container, ...payload }));
+      const fn = rawSyncBinding || (typeof window.__chrometether_vault_sync === 'function' ? window.__chrometether_vault_sync : null);
+      if (fn) {
+        fn(JSONStringify({ ...payload }));
       }
     } catch {}
   };

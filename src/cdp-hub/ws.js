@@ -200,6 +200,11 @@ export class MiniWebSocket extends EventEmitter {
   }
 
   _onData(chunk) {
+    const MAX_FRAME_BYTES = 64 * 1024 * 1024; // 64 MB cap against local DoS
+    if (this._buffer.length + chunk.length > MAX_FRAME_BYTES) {
+      this.close(1009, 'Frame too large');
+      return;
+    }
     this._buffer = this._buffer.length === 0 ? chunk : Buffer.concat([this._buffer, chunk]);
 
     while (this._buffer.length >= 2) {

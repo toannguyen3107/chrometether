@@ -126,6 +126,11 @@ test('buildDnrSessionRulesForTab generates Set-Cookie stripper, Cookie setter, a
   );
 
   const rules = vault.buildDnrSessionRulesForTab('acc-1', 42);
+  // Every rule MUST specify excludedResourceTypes: [] so Chrome does not exclude main_frame by default!
+  for (const r of rules) {
+    assert.deepEqual(r.condition.excludedResourceTypes, []);
+  }
+
   // Rule 1: Set-Cookie removal on responses (B1 fix)
   const stripSetCookie = rules.find(
     r => r.action?.responseHeaders?.[0]?.header === 'set-cookie'
@@ -152,6 +157,12 @@ test('buildDnrSessionRulesForTab generates Set-Cookie stripper, Cookie setter, a
   assert.equal(blockedRules.length, 1);
   assert.equal(blockedRules[0].action.type, 'block');
   assert.deepEqual(blockedRules[0].condition.tabIds, [42]);
+  assert.deepEqual(blockedRules[0].condition.excludedResourceTypes, []);
+
+  // Init script must capture and delete window.__chrometether_vault_sync from Main World
+  const initScript = vault.buildInitScript('acc-1');
+  assert.ok(initScript.includes('delete window.__chrometether_vault_sync'));
+  assert.ok(initScript.includes('const rawSyncBinding ='));
 });
 
 test('extractUrlContainerHint extracts #tether-container and strips it cleanly', () => {

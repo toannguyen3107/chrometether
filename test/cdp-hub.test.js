@@ -74,11 +74,29 @@ test('CdpHubServer enforces Origin guard and Bearer token authentication (Fable 
     });
     validWs.close();
 
-    // 4. Chrome Extension Origin succeeds on /ext
+    // 4. Control endpoint /cdp MUST reject chrome-extension:// Origin if Bearer token is missing
+    await assert.rejects(
+      () =>
+        connectWebSocket(addr.wsEndpoint, {
+          headers: { Origin: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop' }
+        }),
+      /401/
+    );
+
+    // 5. Chrome Extension Origin succeeds on /ext and pins the trusted extension ID
     const extWs = await connectWebSocket(`ws://127.0.0.1:${addr.port}/ext`, {
       headers: { Origin: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop' }
     });
     extWs.close();
+
+    // 6. A different Chrome Extension ID on /ext must be rejected once pinned
+    await assert.rejects(
+      () =>
+        connectWebSocket(`ws://127.0.0.1:${addr.port}/ext`, {
+          headers: { Origin: 'chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }
+        }),
+      /401/
+    );
   } finally {
     await hub.stop();
   }
@@ -186,7 +204,7 @@ test('CdpHubServer + simulated Extension creates same-window Container Tabs, cap
 
   try {
     const extWs = await connectWebSocket(`ws://127.0.0.1:${addr.port}/ext`, {
-      headers: { Origin: 'chrome-extension://testextensionid' }
+      headers: { Origin: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop' }
     });
 
     const extReceivedRequests = [];
@@ -284,6 +302,34 @@ test('CdpHubServer + simulated Extension creates same-window Container Tabs, cap
     );
     assert.ok(cookieSetRule);
     assert.equal(cookieSetRule.action.requestHeaders[0].value, 'session=acc1_live_token');
+
+    // Simulate a compromised script inside tab 11 (acc-1) trying to spoof container: 'acc-2'
+    vault.ensureContainer('acc-2', { color: 'orange' });
+    extWs.send(
+      JSON.stringify({
+        type: 'ext_cdp_event',
+        tabId: 11,
+        method: 'Runtime.bindingCalled',
+        params: {
+          name: '__chrometether_vault_sync',
+          payload: JSON.stringify({
+            container: 'acc-2',
+            type: 'storageSet',
+            session: false,
+            origin: 'https://portal.example.com',
+            key: 'hijack',
+            value: 'spoofed'
+          })
+        }
+      })
+    );
+    await new Promise(r => setTimeout(r, 50));
+
+    // Must be written to acc-1 (tab 11's true container), NEVER to acc-2!
+    assert.deepEqual(vault.getStorageSnapshot('acc-2', 'https://portal.example.com'), {});
+    assert.deepEqual(vault.getStorageSnapshot('acc-1', 'https://portal.example.com'), {
+      hijack: 'spoofed'
+    });
 
     mcpWs.close();
     extWs.close();

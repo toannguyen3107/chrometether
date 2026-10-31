@@ -207,7 +207,7 @@ function buildDnrRulesForLocalContainerTab(containerName, tabId, { failClosedBlo
         id: baseRuleId,
         priority: 1000,
         action: { type: 'block' },
-        condition: { tabIds: [numericTabId], urlFilter: '*' }
+        condition: { tabIds: [numericTabId], urlFilter: '*', excludedResourceTypes: [] }
       }
     ];
   }
@@ -220,7 +220,7 @@ function buildDnrRulesForLocalContainerTab(containerName, tabId, { failClosedBlo
         type: 'modifyHeaders',
         responseHeaders: [{ header: 'set-cookie', operation: 'remove' }]
       },
-      condition: { tabIds: [numericTabId] }
+      condition: { tabIds: [numericTabId], excludedResourceTypes: [] }
     },
     {
       id: baseRuleId + 2,
@@ -229,7 +229,7 @@ function buildDnrRulesForLocalContainerTab(containerName, tabId, { failClosedBlo
         type: 'modifyHeaders',
         requestHeaders: [{ header: 'cookie', operation: 'remove' }]
       },
-      condition: { tabIds: [numericTabId] }
+      condition: { tabIds: [numericTabId], excludedResourceTypes: [] }
     }
   ];
 
@@ -255,7 +255,8 @@ function buildDnrRulesForLocalContainerTab(containerName, tabId, { failClosedBlo
     const allSecure = domainCookies.every(c => c.secure);
     const condition = {
       tabIds: [numericTabId],
-      requestDomains: [domain]
+      requestDomains: [domain],
+      excludedResourceTypes: []
     };
     if (allSecure) condition.urlFilter = '|https*';
 
@@ -299,12 +300,20 @@ function buildInitScriptForLocalContainer(containerName) {
 
   return `(() => {
   if (window.__chrometetherContainerInitialized) return;
-  Object.defineProperty(window, '__chrometetherContainerInitialized', { value: true, configurable: false });
+  const defineProperty = Object.defineProperty;
+  const hasOwn = Object.prototype.hasOwnProperty;
+  const objectKeys = Object.keys;
+  const jsonStringify = JSON.stringify;
+  defineProperty(window, '__chrometetherContainerInitialized', { value: true, configurable: false });
+  const rawSyncBinding = typeof window.__chrometether_vault_sync === 'function'
+    ? window.__chrometether_vault_sync
+    : null;
+  try { delete window.__chrometether_vault_sync; } catch {}
   const state = ${payload};
   const notify = (msg) => {
     try {
-      if (typeof window.__chrometether_vault_sync === 'function') {
-        window.__chrometether_vault_sync(JSON.stringify({ container: state.container, ...msg }));
+      if (rawSyncBinding) {
+        rawSyncBinding(jsonStringify({ container: state.container, ...msg }));
       }
     } catch {}
   };
@@ -914,10 +923,12 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!source.tabId) return;
 
   // Handle in-page document.cookie & localStorage sync binding locally even when Hub is offline!
+  // SECURITY: Never trust `data.container` from page script payload — strictly enforce the container
+  // bound to `source.tabId` so a compromised page in `acc-1` cannot poison `acc-2`.
   if (method === 'Runtime.bindingCalled' && params?.name === '__chrometether_vault_sync') {
     try {
       const data = JSON.parse(params.payload);
-      const cName = data.container || tabContainers.get(source.tabId)?.containerName;
+      const cName = tabContainers.get(source.tabId)?.containerName;
       if (cName) {
         const entry = ensureContainerInLocalVault(cName);
         if (data.type === 'setCookie' && data.cookie) {

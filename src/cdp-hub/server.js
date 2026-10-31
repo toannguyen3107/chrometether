@@ -122,6 +122,9 @@ export class CdpHubServer {
 
     // Connected Chrome Extension (/ext)
     this.extSocket = null;
+    this.trustedExtensionOrigin = process.env.CHROMETETHER_EXTENSION_ID
+      ? `chrome-extension://${process.env.CHROMETETHER_EXTENSION_ID.trim().toLowerCase()}`
+      : null;
     this._extReqSeq = 0;
     this._extPending = new Map();
 
@@ -265,17 +268,43 @@ export class CdpHubServer {
     if (!this.requireAuth) {
       return true;
     }
-    const origin = String(req.headers.origin || '').toLowerCase();
-    if (origin.startsWith('chrome-extension://')) {
-      return true;
-    }
+    // Control endpoints (/cdp, /containers, /shutdown, /json/*) ALWAYS require the secret Bearer token,
+    // never bypassing token authentication solely based on a chrome-extension:// Origin header.
     const provided = extractAuthToken(req, parsedUrl);
     return Boolean(provided && provided === this.token);
   }
 
+  _isAuthorizedExtensionUpgrade(req, parsedUrl) {
+    if (!isAllowedOrigin(req.headers.origin)) {
+      return false;
+    }
+    if (!this.requireAuth) {
+      return true;
+    }
+    const provided = extractAuthToken(req, parsedUrl);
+    if (provided && provided === this.token) {
+      return true;
+    }
+    const origin = String(req.headers.origin || '').trim().toLowerCase();
+    if (/^chrome-extension:\/\/[a-z0-9]{16,64}$/.test(origin)) {
+      if (!this.trustedExtensionOrigin) {
+        // Pin first valid Chrome Extension ID for the lifetime of the Hub session
+        this.trustedExtensionOrigin = origin;
+      }
+      return origin === this.trustedExtensionOrigin;
+    }
+    return false;
+  }
+
   async _readJsonBody(req) {
+    const MAX_BODY_BYTES = 1024 * 1024; // 1 MB cap
     const chunks = [];
+    let totalBytes = 0;
     for await (const chunk of req) {
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_BODY_BYTES) {
+        throw new Error('Request body exceeds 1MB limit');
+      }
       chunks.push(chunk);
     }
     const raw = Buffer.concat(chunks).toString('utf8').trim();
@@ -454,15 +483,21 @@ export class CdpHubServer {
     }
 
     const parsedUrl = new URL(req.url || '/', `http://${this.host}:${this.port}`);
-    if (!this._isAuthorizedRequest(req, parsedUrl)) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-      socket.destroy();
+
+    if (parsedUrl.pathname === '/ext') {
+      if (!this._isAuthorizedExtensionUpgrade(req, parsedUrl)) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      const ws = upgradeToWebSocket(req, socket, head);
+      if (ws) this._onExtensionConnected(ws);
       return;
     }
 
-    if (parsedUrl.pathname === '/ext') {
-      const ws = upgradeToWebSocket(req, socket, head);
-      if (ws) this._onExtensionConnected(ws);
+    if (!this._isAuthorizedRequest(req, parsedUrl)) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
       return;
     }
 
@@ -592,12 +627,11 @@ export class CdpHubServer {
       }
     });
 
-    // Send initial hello with Hub token and current container vault state
+    // Send initial hello with current container vault state (never expose the /cdp Bearer token over /ext)
     ws.send(
       JSON.stringify({
         type: 'hub_hello',
         version: HUB_VERSION,
-        token: this.token,
         containers: this.vault.listContainers()
       })
     );
@@ -1160,24 +1194,49 @@ export class CdpHubServer {
     }
 
     // Handle in-page ContainerVault sync binding calls
+    // SECURITY: Never trust `data.container` from the page payload; always bind to `tab.containerName`
+    // and verify that `data.origin` / `data.url` matches the execution context or tab origin!
     if (method === 'Runtime.bindingCalled' && params.name === '__chrometether_vault_sync') {
       try {
+        const cName = tab.containerName;
+        if (!cName) return;
         const data = JSON.parse(params.payload);
-        const cName = data.container || tab.containerName;
-        if (cName) {
-          if (data.type === 'setCookie' && data.cookie) {
-            this.vault.applySetCookieHeaders(cName, [data.cookie], data.url || tab.url);
-            this._syncContainerDnrRules(cName).catch(() => {});
-          } else if (data.type === 'storageSet') {
-            this.vault.setStorageItem(cName, data.origin, data.key, data.value, {
+        const execCtx = params.executionContextId
+          ? tab.executionContexts.get(params.executionContextId)
+          : null;
+        let trustedOrigin = null;
+        if (execCtx?.origin && execCtx.origin !== 'about:blank' && execCtx.origin !== 'null') {
+          trustedOrigin = execCtx.origin;
+        } else if (tab.url && tab.url.startsWith('http')) {
+          try {
+            trustedOrigin = new URL(tab.url).origin;
+          } catch {
+            trustedOrigin = null;
+          }
+        }
+
+        if (data.type === 'setCookie' && data.cookie) {
+          const targetUrl = trustedOrigin ? tab.url : data.url || tab.url;
+          this.vault.applySetCookieHeaders(cName, [data.cookie], targetUrl);
+          this._syncContainerDnrRules(cName).catch(() => {});
+        } else if (data.type === 'storageSet') {
+          const effectiveOrigin = trustedOrigin || data.origin;
+          if (effectiveOrigin) {
+            this.vault.setStorageItem(cName, effectiveOrigin, data.key, data.value, {
               session: Boolean(data.session)
             });
-          } else if (data.type === 'storageRemove') {
-            this.vault.removeStorageItem(cName, data.origin, data.key, {
+          }
+        } else if (data.type === 'storageRemove') {
+          const effectiveOrigin = trustedOrigin || data.origin;
+          if (effectiveOrigin) {
+            this.vault.removeStorageItem(cName, effectiveOrigin, data.key, {
               session: Boolean(data.session)
             });
-          } else if (data.type === 'storageClear') {
-            this.vault.clearStorageOrigin(cName, data.origin, {
+          }
+        } else if (data.type === 'storageClear') {
+          const effectiveOrigin = trustedOrigin || data.origin;
+          if (effectiveOrigin) {
+            this.vault.clearStorageOrigin(cName, effectiveOrigin, {
               session: Boolean(data.session)
             });
           }
