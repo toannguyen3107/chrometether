@@ -125,16 +125,20 @@ export async function ensureHubDaemon({
   }
 
   const serverScript = path.join(__dirname, 'server.js');
-  const child = spawn(process.execPath, [serverScript], {
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: true,
-    env: {
-      ...process.env,
-      CHROMETETHER_HUB_PORT: String(port),
-      CHROMETETHER_HUB_TOKEN: token
+  const child = spawn(
+    process.execPath,
+    [serverScript, `--port=${port}`, `--token=${token}`],
+    {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      env: {
+        ...process.env,
+        CHROMETETHER_HUB_PORT: String(port),
+        CHROMETETHER_HUB_TOKEN: token
+      }
     }
-  });
+  );
   child.unref();
 
   const deadline = Date.now() + waitTimeoutMs;

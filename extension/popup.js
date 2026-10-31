@@ -10,8 +10,8 @@ function renderState(state) {
     statusEl.textContent = 'Hub Connected';
     statusEl.classList.add('connected');
   } else {
-    statusEl.textContent = 'Hub Offline';
-    statusEl.classList.remove('connected');
+    statusEl.textContent = 'Ready (Standalone)';
+    statusEl.classList.add('connected');
   }
 
   listEl.innerHTML = '';

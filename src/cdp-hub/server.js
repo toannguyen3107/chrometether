@@ -1730,7 +1730,18 @@ const isMain =
   path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
 
 if (isMain) {
+  let cliPort;
+  let cliToken;
+  for (const arg of process.argv.slice(2)) {
+    if (arg.startsWith('--port=')) {
+      cliPort = Number.parseInt(arg.slice('--port='.length), 10);
+    } else if (arg.startsWith('--token=')) {
+      cliToken = arg.slice('--token='.length).trim();
+    }
+  }
   const hub = new CdpHubServer({
+    ...(Number.isInteger(cliPort) && cliPort > 0 ? { port: cliPort } : {}),
+    ...(cliToken ? { token: cliToken } : {}),
     autoConnectDirectCdp: true
   });
   hub.start().catch(err => {

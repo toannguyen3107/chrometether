@@ -1,15 +1,30 @@
 // ChromeTether MV3 Background Service Worker
 // Provides:
 // 1. Outbound WebSocket bridge to Local CDP Hub (ws://127.0.0.1:19222/ext) with 20s keep-alive
-// 2. Same-window Multi-Account Container Tabs via chrome.tabGroups
+//    (probes http://127.0.0.1:19222/health first so Chrome never logs WebSocket ERR_CONNECTION_REFUSED errors)
+// 2. Same-window Multi-Account Container Tabs via chrome.tabGroups (works both with Hub and standalone)
 // 3. Manifest V3 declarativeNetRequest (DNR) session rules keyed by tabIds (Cookie set + Set-Cookie strip)
 // 4. Raw Set-Cookie capture via webRequest.onHeadersReceived (extraHeaders)
 // 5. Fail-closed detach protection when chrome.debugger detaches unexpectedly
 
+const HUB_HEALTH_URL = 'http://127.0.0.1:19222/health';
 const HUB_WS_URL = 'ws://127.0.0.1:19222/ext';
 const KEEPALIVE_INTERVAL_MS = 20000;
 
+const COLOR_BADGES = {
+  blue: '🔵',
+  orange: '🟠',
+  green: '🟢',
+  purple: '🟣',
+  pink: '🩷',
+  cyan: '🩵',
+  yellow: '🟡',
+  red: '🔴',
+  grey: '⚪'
+};
+
 let ws = null;
+let isConnecting = false;
 let reconnectTimer = null;
 let keepAliveTimer = null;
 let hubToken = null;
@@ -20,14 +35,51 @@ const tabContainers = new Map();
 // Set of tabIds with active chrome.debugger attachment
 const attachedTabs = new Set();
 
+function buildDefaultInitScript(containerName) {
+  const safeName = JSON.stringify(String(containerName || 'default'));
+  return `(() => {
+  if (window.__chrometetherContainerInitialized) return;
+  Object.defineProperty(window, '__chrometetherContainerInitialized', { value: true, configurable: false });
+  window.__chrometetherContainerName = ${safeName};
+  try {
+    if (navigator.serviceWorker) {
+      navigator.serviceWorker.register = () => Promise.reject(new DOMException('ServiceWorker disabled in ChromeTether Container Tab', 'SecurityError'));
+    }
+  } catch {}
+})();`;
+}
+
+function ensureLocalContainerRecord(containerName, color = 'blue') {
+  const cleanName = String(containerName || 'acc-1').trim();
+  const badge = COLOR_BADGES[color] || '🔵';
+  let found = knownContainers.find(c => c.name === cleanName);
+  if (!found) {
+    found = {
+      name: cleanName,
+      color: color || 'blue',
+      badge,
+      cookieCount: 0
+    };
+    knownContainers.push(found);
+  } else if (color) {
+    found.color = color;
+    found.badge = badge;
+  }
+  return found;
+}
+
 async function restoreSessionState() {
   try {
-    const data = await chrome.storage.session.get(['tabContainers']);
+    const data = await chrome.storage.session.get(['tabContainers', 'knownContainers']);
+    if (Array.isArray(data?.knownContainers)) {
+      knownContainers = data.knownContainers;
+    }
     if (data?.tabContainers && typeof data.tabContainers === 'object') {
       for (const [k, v] of Object.entries(data.tabContainers)) {
         const tabId = Number(k);
         if (Number.isInteger(tabId) && v?.containerName) {
           tabContainers.set(tabId, v);
+          ensureLocalContainerRecord(v.containerName, v.color);
         }
       }
     }
@@ -42,7 +94,10 @@ async function persistSessionState() {
     for (const [tabId, info] of tabContainers.entries()) {
       serialized[tabId] = info;
     }
-    await chrome.storage.session.set({ tabContainers: serialized });
+    await chrome.storage.session.set({
+      tabContainers: serialized,
+      knownContainers
+    });
   } catch {
     // ignore
   }
@@ -144,24 +199,32 @@ async function configureContainerDebuggerOnTab(tabId, containerInfo) {
       name: '__chrometether_vault_sync'
     });
     await chrome.debugger.sendCommand(target, 'Page.enable', {});
-    if (containerInfo.initScript) {
-      await chrome.debugger.sendCommand(target, 'Page.addScriptToEvaluateOnNewDocument', {
-        source: containerInfo.initScript
-      });
-    }
+    const scriptSource =
+      containerInfo.initScript || buildDefaultInitScript(containerInfo.containerName);
+    await chrome.debugger.sendCommand(target, 'Page.addScriptToEvaluateOnNewDocument', {
+      source: scriptSource
+    });
     // Auto-attach OOPIFs in flatten mode so cross-origin login frames remain isolated
-    await chrome.debugger.sendCommand(target, 'Target.setAutoAttach', {
-      autoAttach: true,
-      waitForDebuggerOnStart: false,
-      flatten: true
-    }).catch(() => {});
+    await chrome.debugger
+      .sendCommand(target, 'Target.setAutoAttach', {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true
+      })
+      .catch(() => {});
     return true;
   } catch {
     return false;
   }
 }
 
-async function placeTabInContainerGroup(tabId, windowId, containerName, color = 'blue', badge = '🔵') {
+async function placeTabInContainerGroup(
+  tabId,
+  windowId,
+  containerName,
+  color = 'blue',
+  badge = '🔵'
+) {
   try {
     const title = `${badge} ${containerName}`;
     const existingGroups = await chrome.tabGroups.query({ windowId, title });
@@ -182,6 +245,133 @@ async function placeTabInContainerGroup(tabId, windowId, containerName, color = 
   } catch {
     return null;
   }
+}
+
+async function createContainerTabLocal({
+  url = 'about:blank',
+  background = false,
+  containerName,
+  color = 'blue',
+  badge,
+  initScript
+}) {
+  const effectiveBadge = badge || COLOR_BADGES[color] || '🔵';
+  const created = await chrome.tabs.create({
+    url: 'about:blank',
+    active: !background
+  });
+  const tabId = created.id;
+
+  if (containerName) {
+    ensureLocalContainerRecord(containerName, color);
+    const info = {
+      containerName,
+      color: color || 'blue',
+      badge: effectiveBadge,
+      initScript: initScript || buildDefaultInitScript(containerName)
+    };
+    tabContainers.set(tabId, info);
+    await persistSessionState();
+    await updateTabDnrSessionRules(tabId, [
+      {
+        id: tabId * 100 + 1,
+        priority: 100,
+        action: {
+          type: 'modifyHeaders',
+          responseHeaders: [{ header: 'set-cookie', operation: 'remove' }]
+        },
+        condition: { tabIds: [tabId] }
+      },
+      {
+        id: tabId * 100 + 2,
+        priority: 150,
+        action: {
+          type: 'modifyHeaders',
+          requestHeaders: [{ header: 'cookie', operation: 'remove' }]
+        },
+        condition: { tabIds: [tabId] }
+      }
+    ]);
+    await placeTabInContainerGroup(
+      tabId,
+      created.windowId,
+      containerName,
+      info.color,
+      info.badge
+    );
+    await configureContainerDebuggerOnTab(tabId, info);
+  }
+
+  if (url && url !== 'about:blank') {
+    await chrome.tabs.update(tabId, { url });
+  }
+
+  return {
+    tabId,
+    windowId: created.windowId,
+    url,
+    title: created.title || url
+  };
+}
+
+async function convertTabToContainerLocal({
+  tabId,
+  containerName,
+  color = 'blue',
+  badge,
+  initScript,
+  dnrRules,
+  originalUrl
+}) {
+  const numericTabId = Number(tabId);
+  const tab = await chrome.tabs.get(numericTabId);
+  const effectiveBadge = badge || COLOR_BADGES[color] || '🔵';
+  ensureLocalContainerRecord(containerName, color);
+  const info = {
+    containerName,
+    color: color || 'blue',
+    badge: effectiveBadge,
+    initScript: initScript || buildDefaultInitScript(containerName)
+  };
+  tabContainers.set(numericTabId, info);
+  await persistSessionState();
+
+  await chrome.tabs.update(numericTabId, { url: 'about:blank' });
+  const rulesToApply = Array.isArray(dnrRules)
+    ? dnrRules
+    : [
+        {
+          id: numericTabId * 100 + 1,
+          priority: 100,
+          action: {
+            type: 'modifyHeaders',
+            responseHeaders: [{ header: 'set-cookie', operation: 'remove' }]
+          },
+          condition: { tabIds: [numericTabId] }
+        },
+        {
+          id: numericTabId * 100 + 2,
+          priority: 150,
+          action: {
+            type: 'modifyHeaders',
+            requestHeaders: [{ header: 'cookie', operation: 'remove' }]
+          },
+          condition: { tabIds: [numericTabId] }
+        }
+      ];
+  await updateTabDnrSessionRules(numericTabId, rulesToApply);
+  await placeTabInContainerGroup(
+    numericTabId,
+    tab.windowId,
+    containerName,
+    info.color,
+    info.badge
+  );
+  await configureContainerDebuggerOnTab(numericTabId, info);
+  if (originalUrl && originalUrl !== 'about:blank') {
+    await chrome.tabs.update(numericTabId, { url: originalUrl });
+  }
+  return { ok: true, tabId: numericTabId };
 }
 
 async function sendTabsSnapshot() {
@@ -206,98 +396,32 @@ async function handleHubRequest(msg) {
     let result = {};
 
     if (action === 'create_tab') {
-      const { url = 'about:blank', background = false, containerName, color, badge, initScript } = params;
-      // Born at about:blank first so DNR rules + initScript are active before first navigation (Fable 3.2)
-      const created = await chrome.tabs.create({
-        url: 'about:blank',
-        active: !background
-      });
-      const tabId = created.id;
-
-      if (containerName) {
-        const info = {
-          containerName,
-          color: color || 'blue',
-          badge: badge || '🔵',
-          initScript: initScript || ''
-        };
-        tabContainers.set(tabId, info);
-        await persistSessionState();
-        // Install baseline Set-Cookie strip + Cookie strip DNR rules immediately
-        await updateTabDnrSessionRules(tabId, [
-          {
-            id: tabId * 100 + 1,
-            priority: 100,
-            action: {
-              type: 'modifyHeaders',
-              responseHeaders: [{ header: 'set-cookie', operation: 'remove' }]
-            },
-            condition: { tabIds: [tabId] }
-          },
-          {
-            id: tabId * 100 + 2,
-            priority: 150,
-            action: {
-              type: 'modifyHeaders',
-              requestHeaders: [{ header: 'cookie', operation: 'remove' }]
-            },
-            condition: { tabIds: [tabId] }
-          }
-        ]);
-        await placeTabInContainerGroup(tabId, created.windowId, containerName, info.color, info.badge);
-        await configureContainerDebuggerOnTab(tabId, info);
-      }
-
-      if (url && url !== 'about:blank') {
-        await chrome.tabs.update(tabId, { url });
-      }
-
-      result = {
-        tabId,
-        windowId: created.windowId,
-        url,
-        title: created.title || url
-      };
+      result = await createContainerTabLocal(params);
     } else if (action === 'convert_tab_to_container') {
-      // Safe conversion flow (Fable 3.2): navigate to about:blank -> attach & DNR -> reload originalUrl
-      const { tabId, containerName, color, badge, initScript, dnrRules, originalUrl } = params;
-      const numericTabId = Number(tabId);
-      const tab = await chrome.tabs.get(numericTabId);
-      const info = {
-        containerName,
-        color: color || 'blue',
-        badge: badge || '🔵',
-        initScript: initScript || ''
-      };
-      tabContainers.set(numericTabId, info);
-      await persistSessionState();
-
-      await chrome.tabs.update(numericTabId, { url: 'about:blank' });
-      if (Array.isArray(dnrRules)) {
-        await updateTabDnrSessionRules(numericTabId, dnrRules);
-      }
-      await placeTabInContainerGroup(numericTabId, tab.windowId, containerName, info.color, info.badge);
-      await configureContainerDebuggerOnTab(numericTabId, info);
-      if (originalUrl && originalUrl !== 'about:blank') {
-        await chrome.tabs.update(numericTabId, { url: originalUrl });
-      }
-      result = { ok: true, tabId: numericTabId };
+      result = await convertTabToContainerLocal(params);
     } else if (action === 'assign_tab_container') {
       const { tabId, containerName, color, badge, initScript, dnrRules } = params;
       const numericTabId = Number(tabId);
       const tab = await chrome.tabs.get(numericTabId);
+      ensureLocalContainerRecord(containerName, color);
       const info = {
         containerName,
         color: color || 'blue',
-        badge: badge || '🔵',
-        initScript: initScript || ''
+        badge: badge || COLOR_BADGES[color] || '🔵',
+        initScript: initScript || buildDefaultInitScript(containerName)
       };
       tabContainers.set(numericTabId, info);
       await persistSessionState();
       if (Array.isArray(dnrRules)) {
         await updateTabDnrSessionRules(numericTabId, dnrRules);
       }
-      await placeTabInContainerGroup(numericTabId, tab.windowId, containerName, info.color, info.badge);
+      await placeTabInContainerGroup(
+        numericTabId,
+        tab.windowId,
+        containerName,
+        info.color,
+        info.badge
+      );
       await configureContainerDebuggerOnTab(numericTabId, info);
       result = { ok: true };
     } else if (action === 'update_tab_dnr_rules') {
@@ -321,7 +445,12 @@ async function handleHubRequest(msg) {
     } else if (action === 'cdp_command') {
       const numericTabId = Number(params.tabId);
       await ensureDebuggerAttached(numericTabId);
-      result = (await chrome.debugger.sendCommand({ tabId: numericTabId }, params.method, params.params || {})) || {};
+      result =
+        (await chrome.debugger.sendCommand(
+          { tabId: numericTabId },
+          params.method,
+          params.params || {}
+        )) || {};
     }
 
     sendToHub({ type: 'hub_response', reqId, result });
@@ -420,7 +549,6 @@ chrome.debugger.onDetach.addListener(async (source, reason) => {
 
   if (tabContainers.has(tabId)) {
     const info = tabContainers.get(tabId);
-    // Try immediate re-attach unless the tab itself was closed
     if (reason !== 'target_closed') {
       const reattached = await configureContainerDebuggerOnTab(tabId, info);
       if (!reattached) {
@@ -431,8 +559,27 @@ chrome.debugger.onDetach.addListener(async (source, reason) => {
   }
 });
 
-function connectHub() {
+async function connectHub() {
+  if (isConnecting) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  isConnecting = true;
+  try {
+    // Probe /health via fetch first so Chrome does not log red WebSocket connection errors when Hub is idle
+    const healthResp = await fetch(HUB_HEALTH_URL, {
+      method: 'GET',
+      cache: 'no-store'
+    });
+    if (!healthResp.ok) {
+      isConnecting = false;
+      scheduleReconnect(4000);
+      return;
+    }
+  } catch {
+    isConnecting = false;
+    scheduleReconnect(4000);
     return;
   }
 
@@ -441,11 +588,13 @@ function connectHub() {
       ? new WebSocket(HUB_WS_URL, [`chrometether-token.${hubToken}`])
       : new WebSocket(HUB_WS_URL);
   } catch {
-    scheduleReconnect();
+    isConnecting = false;
+    scheduleReconnect(4000);
     return;
   }
 
   ws.onopen = async () => {
+    isConnecting = false;
     if (keepAliveTimer) clearInterval(keepAliveTimer);
     keepAliveTimer = setInterval(() => {
       sendToHub({ type: 'ping', ts: Date.now() });
@@ -460,7 +609,10 @@ function connectHub() {
       const msg = JSON.parse(String(event.data));
       if (msg.type === 'hub_hello') {
         if (msg.token) hubToken = msg.token;
-        if (Array.isArray(msg.containers)) knownContainers = msg.containers;
+        if (Array.isArray(msg.containers)) {
+          knownContainers = msg.containers;
+          persistSessionState();
+        }
         return;
       }
       if (msg.type === 'ping') {
@@ -476,15 +628,17 @@ function connectHub() {
   };
 
   ws.onclose = () => {
+    isConnecting = false;
     ws = null;
     if (keepAliveTimer) {
       clearInterval(keepAliveTimer);
       keepAliveTimer = null;
     }
-    scheduleReconnect();
+    scheduleReconnect(4000);
   };
 
   ws.onerror = () => {
+    isConnecting = false;
     try {
       ws?.close();
     } catch {
@@ -493,17 +647,18 @@ function connectHub() {
   };
 }
 
-function scheduleReconnect() {
+function scheduleReconnect(delayMs = 4000) {
   if (reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connectHub();
-  }, 2000);
+  }, delayMs);
 }
 
-// Handle messages from Extension Popup UI
+// Handle messages from Extension Popup UI (works both when Hub is connected and standalone)
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'popup_get_state') {
+    connectHub();
     sendResponse({
       connected: Boolean(ws && ws.readyState === WebSocket.OPEN),
       containers: knownContainers,
@@ -512,8 +667,38 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg?.type === 'popup_action') {
-    const ok = sendToHub({ type: 'ext_popup_action', ...msg.payload });
-    sendResponse({ ok });
+    const payload = msg.payload || {};
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const ok = sendToHub({ type: 'ext_popup_action', ...payload });
+      sendResponse({ ok, mode: 'hub' });
+      return true;
+    }
+
+    // Fallback to standalone execution inside the extension when Hub is idle
+    (async () => {
+      if (payload.action === 'open_container_tab') {
+        await createContainerTabLocal({
+          containerName: payload.containerName || 'acc-1',
+          color: payload.color || 'blue',
+          url: payload.url || 'about:blank',
+          background: false
+        });
+      } else if (payload.action === 'convert_current_tab' && payload.tabId) {
+        await convertTabToContainerLocal({
+          tabId: payload.tabId,
+          containerName: payload.containerName || 'acc-1',
+          color: payload.color || 'blue',
+          originalUrl: payload.url || 'about:blank'
+        });
+      } else if (payload.action === 'clear_container' && payload.containerName) {
+        for (const [tabId, info] of tabContainers.entries()) {
+          if (info.containerName === payload.containerName) {
+            await clearTabDnrSessionRules(tabId);
+          }
+        }
+      }
+      sendResponse({ ok: true, mode: 'standalone' });
+    })();
     return true;
   }
   return false;
