@@ -1524,9 +1524,15 @@ export class CdpHubServer {
     }
 
     // Broadcast event to all virtual page sessions attached to this tab across all MCP clients
+    if (method.startsWith('Audits.') || method.startsWith('Debugger.') || method.startsWith('Target.')) {
+      return;
+    }
     for (const client of this.mcpClients.values()) {
       for (const [vSessionId, sessionInfo] of client.sessions.entries()) {
         if (sessionInfo.tabKey === tab.key && sessionInfo.kind === 'page') {
+          if (method.startsWith('Runtime.') && !tab.domainRefCounts.Runtime.has(vSessionId)) {
+            continue;
+          }
           this._sendMcpEvent(client, method, params, vSessionId);
         }
       }
@@ -2042,6 +2048,18 @@ export class CdpHubServer {
   async _handlePageSessionCommand(client, tab, sessionId, id, method, params) {
     // Domain enable/disable ref-counting & state replay (Fixes Fable H1)
     const [domain, action] = String(method).split('.');
+    if (domain === 'Audits') {
+      this._sendMcpResponse(client, id, {}, sessionId);
+      return;
+    }
+    if (domain === 'Debugger') {
+      if (action === 'enable') {
+        this._sendMcpResponse(client, id, { debuggerId: `dbg-${tab.key}` }, sessionId);
+      } else {
+        this._sendMcpResponse(client, id, {}, sessionId);
+      }
+      return;
+    }
     if (action === 'enable' && tab.domainRefCounts[domain]) {
       const refSet = tab.domainRefCounts[domain];
       const wasEmpty = refSet.size === 0;
@@ -2050,7 +2068,7 @@ export class CdpHubServer {
         (this.directWs && this.directWs.readyState === WS_STATE.OPEN && tab.upstreamTargetId);
 
       if (domain === 'Runtime') {
-        if (hasRealUpstream && (wasEmpty || tab.executionContexts.size === 0)) {
+        if (hasRealUpstream && tab.executionContexts.size === 0) {
           if (!tab._runtimeEnablePromise) {
             tab._runtimeEnablePromise = (async () => {
               try {
@@ -2062,6 +2080,10 @@ export class CdpHubServer {
                     name: '__chrometether_vault_sync'
                   }).catch(() => {});
                 }
+                const deadline = Date.now() + 60;
+                while (tab.executionContexts.size === 0 && Date.now() < deadline) {
+                  await new Promise(r => setTimeout(r, 10));
+                }
               } finally {
                 tab._runtimeEnablePromise = null;
               }
@@ -2069,7 +2091,6 @@ export class CdpHubServer {
           }
           await tab._runtimeEnablePromise;
         }
-        refSet.add(sessionId);
         this._sendMcpResponse(client, id, {}, sessionId);
 
         if (!hasRealUpstream && tab.executionContexts.size === 0) {
@@ -2082,13 +2103,17 @@ export class CdpHubServer {
             auxData: { isDefault: true, type: 'default', frameId: fallbackFrameId }
           });
         }
-        for (const ctx of tab.executionContexts.values()) {
-          this._sendMcpEvent(
-            client,
-            'Runtime.executionContextCreated',
-            { context: ctx },
-            sessionId
-          );
+        const alreadyHadSession = refSet.has(sessionId);
+        refSet.add(sessionId);
+        if (!alreadyHadSession) {
+          for (const ctx of tab.executionContexts.values()) {
+            this._sendMcpEvent(
+              client,
+              'Runtime.executionContextCreated',
+              { context: ctx },
+              sessionId
+            );
+          }
         }
         return;
       }

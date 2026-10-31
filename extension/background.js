@@ -965,16 +965,12 @@ async function configureContainerDebuggerOnTab(tabId, containerInfo) {
       name: '__chrometether_vault_sync'
     });
     await chrome.debugger.sendCommand(target, 'Page.enable', {});
+    await chrome.debugger
+      .sendCommand(target, 'Page.setLifecycleEventsEnabled', { enabled: true })
+      .catch(() => {});
     const scriptSource =
       containerInfo.initScript || buildInitScriptForLocalContainer(containerInfo.containerName);
     await refreshTabInitScript(numericTabId, containerInfo, scriptSource);
-    await chrome.debugger
-      .sendCommand(target, 'Target.setAutoAttach', {
-        autoAttach: true,
-        waitForDebuggerOnStart: false,
-        flatten: true
-      })
-      .catch(() => {});
     return true;
   } catch {
     return false;
@@ -1085,6 +1081,17 @@ async function createContainerTabLocal({
       broadcastPopupState();
       if (!fromHub) {
         syncLocalVaultToHub();
+      }
+    } else if (fromHub) {
+      const ok = await ensureDebuggerAttached(tabId);
+      if (ok) {
+        const target = { tabId };
+        await chrome.debugger.sendCommand(target, 'Network.enable', {}).catch(() => {});
+        await chrome.debugger.sendCommand(target, 'Runtime.enable', {}).catch(() => {});
+        await chrome.debugger.sendCommand(target, 'Page.enable', {}).catch(() => {});
+        await chrome.debugger
+          .sendCommand(target, 'Page.setLifecycleEventsEnabled', { enabled: true })
+          .catch(() => {});
       }
     }
 
@@ -1617,6 +1624,10 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     } catch {
       // ignore
     }
+  }
+
+  if (source.sessionId || String(method).startsWith('Target.')) {
+    return;
   }
 
   sendToHub({

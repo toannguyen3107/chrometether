@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   HUB_VERSION,
   getHubHttpUrl,
@@ -173,6 +173,9 @@ export function buildMcpHubArgs({
   if (!filtered.includes('--no-usage-statistics')) {
     filtered.push('--no-usage-statistics');
   }
+  if (!filtered.includes('--no-performance-crux')) {
+    filtered.push('--no-performance-crux');
+  }
   if (!filtered.includes('--allow-unrestricted-paths')) {
     filtered.push('--allow-unrestricted-paths');
   }
@@ -215,6 +218,17 @@ export function resolveBundledDevToolsMcpScript(projectDir = PROJECT_ROOT) {
  * Launch `chrome-devtools-mcp` connected to the Local Hub over stdio.
  */
 export async function runLauncher(userArgs = process.argv.slice(2)) {
+  process.env.CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS = '1';
+
+  const origWarn = console.warn;
+  console.warn = (...args) => {
+    const first = typeof args[0] === 'string' ? args[0] : '';
+    if (first.includes('No handler registered for issue code')) {
+      return;
+    }
+    return origWarn.apply(console, args);
+  };
+
   const port = getHubPort();
   const token = getOrCreateHubToken();
 
@@ -223,15 +237,49 @@ export async function runLauncher(userArgs = process.argv.slice(2)) {
   const mcpArgs = buildMcpHubArgs({ port, token, extraArgs: userArgs });
   const scriptPath = resolveBundledDevToolsMcpScript();
 
-  const cmd = scriptPath ? process.execPath : 'npx';
-  const finalArgs = scriptPath
-    ? [scriptPath, ...mcpArgs]
-    : ['-y', 'chrome-devtools-mcp@1.9.0', ...mcpArgs];
+  if (scriptPath) {
+    // Run in-process so stdio closure kills the server cleanly on Windows (zero orphaned child processes)
+    // and prevent `roots/list` timeout deadlocks when `--allow-unrestricted-paths` is active.
+    try {
+      const thirdPartyPath = path.resolve(
+        path.dirname(scriptPath),
+        '..',
+        'third_party',
+        'index.js'
+      );
+      if (fs.existsSync(thirdPartyPath) && mcpArgs.includes('--allow-unrestricted-paths')) {
+        const thirdParty = await import(pathToFileURL(thirdPartyPath).href);
+        if (thirdParty?.McpServer) {
+          const probe = new thirdParty.McpServer({ name: 'probe', version: '1.0.0' });
+          const proto = probe?.server ? Object.getPrototypeOf(probe.server) : null;
+          if (proto && typeof proto.getClientCapabilities === 'function') {
+            const origGetCaps = proto.getClientCapabilities;
+            proto.getClientCapabilities = function (...cArgs) {
+              const caps = origGetCaps.apply(this, cArgs);
+              if (caps && typeof caps === 'object' && 'roots' in caps) {
+                return { ...caps, roots: undefined };
+              }
+              return caps;
+            };
+          }
+        }
+      }
+    } catch {
+      // Non-fatal if third_party layout changes
+    }
 
-  const child = spawn(cmd, finalArgs, {
+    process.argv = [process.execPath, scriptPath, ...mcpArgs];
+    await import(pathToFileURL(scriptPath).href);
+    return;
+  }
+
+  const child = spawn('npx', ['-y', 'chrome-devtools-mcp@1.9.0', ...mcpArgs], {
     stdio: 'inherit',
     windowsHide: true,
-    env: process.env
+    env: {
+      ...process.env,
+      CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS: '1'
+    }
   });
 
   child.on('exit', (code, signal) => {
