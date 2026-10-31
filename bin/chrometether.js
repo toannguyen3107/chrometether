@@ -2,17 +2,23 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { detectAgents } from '../src/installer/agent-detector.js';
+import { ContainerVault } from '../src/cdp-hub/container-vault.js';
 import {
-  mergeMcpConfig,
+  checkHubHealth,
+  ensureHubDaemon,
+  stopHubDaemon
+} from '../src/cdp-hub/launcher.js';
+import { getHubPort, getOrCreateHubToken } from '../src/cdp-hub/token.js';
+import { detectAgents } from '../src/installer/agent-detector.js';
+import { installAntigravity } from '../src/installer/antigravity.js';
+import {
   getBrowserMcpConfigs,
+  getChromeDevToolsLaunch,
+  getNodeCommand,
   getOpenCodeMcpConfigs,
   getZCodeMcpConfigs,
-  getNodeCommand,
-  getChromeDevToolsScript,
-  getChromeDevToolsLaunch
+  mergeMcpConfig
 } from '../src/installer/config-merger.js';
-import { installAntigravity } from '../src/installer/antigravity.js';
 import { getAgentPaths, getHome } from '../src/installer/paths.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -36,15 +42,19 @@ Commands:
   install [agent]      Install/merge MCP configuration into agents (default: all detected)
                        Supported: all, zcode, opencode, claude-code, claude-desktop, cursor, windsurf, roo-code, cline, antigravity, dsh
                        Options: --force (install to all supported paths even when none are detected)
+  hub <subcommand>     Manage the Local CDP Hub daemon (status [--json] | start | stop | token)
+  containers <sub>     Manage Multi-Account Containers (list [--json] | create <name> [color] | clear <name> | delete <name>)
   test                 Run full diagnostics and health check
   start-reader         Start the Tier 1 Reader MCP server on stdio
+  start-containers     Start the Multi-Account Containers MCP server on stdio
   help                 Display this help information
 
 Examples:
   node bin/chrometether.js status
-  node bin/chrometether.js install zcode
-  node bin/chrometether.js install opencode
   node bin/chrometether.js install all
+  node bin/chrometether.js hub status
+  node bin/chrometether.js containers create acc-1 blue
+  node bin/chrometether.js containers create acc-2 orange
   node bin/chrometether.js test
 `);
 }
@@ -132,21 +142,18 @@ function handleInstall(targetAgent = 'all', extraArgs = []) {
           fs.mkdirSync(patchDir, { recursive: true });
         }
 
+        // Single source of truth via getChromeDevToolsLaunch (Fixes Fable M4)
+        const dtLaunch = getChromeDevToolsLaunch(projectDir);
+        const dtCommand = dtLaunch.command.replace(/\\/g, '/');
+        const dtArgsYaml = dtLaunch.args
+          .map(a => `          - ${String(a).replace(/\\/g, '/')}`)
+          .join('\n');
+
         const nodeExe = getNodeCommand().replace(/\\/g, '/');
         const tetherReaderScript = path.join(projectDir, 'src', 'reader-server', 'index.js').replace(/\\/g, '/');
         const tetherMapScript = path.join(projectDir, 'src', 'app-map', 'server.js').replace(/\\/g, '/');
-        const chromeDevtoolsScript = getChromeDevToolsScript(projectDir).replace(/\\/g, '/');
+        const tetherContainersScript = path.join(projectDir, 'src', 'containers-server', 'index.js').replace(/\\/g, '/');
         const projectDirFwd = projectDir.replace(/\\/g, '/');
-
-        const dshMapSnippet = `    - id: mcp-tether-map
-      name: '@deepseek-ai/dsh-mcp-client'
-      config:
-        serverName: tether_map
-        transport: stdio
-        command: ${nodeExe}
-        args:
-          - ${tetherMapScript}
-        cwd: ${projectDirFwd}\n`;
 
         const dshSnippet = `    - id: mcp-tether-reader
       name: '@deepseek-ai/dsh-mcp-client'
@@ -162,12 +169,28 @@ function handleInstall(targetAgent = 'all', extraArgs = []) {
       config:
         serverName: chrome_devtools
         transport: stdio
+        command: ${dtCommand}
+        args:
+${dtArgsYaml}
+        cwd: ${projectDirFwd}
+    - id: mcp-tether-map
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: tether_map
+        transport: stdio
         command: ${nodeExe}
         args:
-          - ${chromeDevtoolsScript}
-          - --auto-connect
+          - ${tetherMapScript}
         cwd: ${projectDirFwd}
-${dshMapSnippet}`;
+    - id: mcp-tether-containers
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: tether_containers
+        transport: stdio
+        command: ${nodeExe}
+        args:
+          - ${tetherContainersScript}
+        cwd: ${projectDirFwd}\n`;
 
         let content = '';
         if (fs.existsSync(patchPath)) {
@@ -181,9 +204,9 @@ ${dshMapSnippet}`;
           fs.writeFileSync(`${patchPath}.${timestamp}.bak`, content, 'utf8');
         }
 
-        // Remove any previous mcp-tether-reader, mcp-chrome-devtools, mcp-tether-map blocks before inserting fresh ones
+        // Remove any previous mcp-tether-reader, mcp-chrome-devtools, mcp-tether-map, mcp-tether-containers blocks
         content = content.replace(
-          /^[ \t]*-\s*id:\s*mcp-(?:tether-reader|chrome-devtools|tether-map|agy-reader)\r?\n(?:[ \t]{6,}.*\r?\n)*/gm,
+          /^[ \t]*-\s*id:\s*mcp-(?:tether-reader|chrome-devtools|tether-map|tether-containers|agy-reader)\r?\n(?:[ \t]{6,}.*\r?\n)*/gm,
           ''
         );
 
@@ -241,7 +264,6 @@ ${dshMapSnippet}`;
   const localSkillsDir = path.join(projectDir, 'skills');
   const userHome = getHome();
 
-  // 1. Copy skills to Claude Code if Claude Code was targeted or detected
   if (targets.some(t => t.id === 'claude-code')) {
     const claudeSkillsDir = path.join(userHome, '.claude', 'skills');
     if (fs.existsSync(localSkillsDir)) {
@@ -257,7 +279,6 @@ ${dshMapSnippet}`;
     }
   }
 
-  // 2. Copy skills, slash command, and instructions to ZCode if ZCode was targeted
   if (targets.some(t => t.id === 'zcode')) {
     const zcodeSkillsDir = path.join(userHome, '.zcode', 'skills');
     const zcodeCommandsDir = path.join(userHome, '.zcode', 'commands');
@@ -299,6 +320,7 @@ ${dshMapSnippet}`;
 
   console.log('----------------------------------------------------');
   console.log('✔ ChromeTether MCP configuration complete!');
+  console.log(`ℹ Companion Chrome Extension folder: ${path.join(projectDir, 'extension')}`);
   console.log('ℹ Next step: Copy the relevant rule file to your project:');
   console.log('  - For Claude:    Copy prompts/CLAUDE.md into your project (skills already in ~/.claude/skills/)');
   console.log('  - For ZCode:     Type /browser in chat! Skills & command are installed in ~/.zcode/');
@@ -307,6 +329,127 @@ ${dshMapSnippet}`;
   console.log('  - For Windsurf:  Copy prompts/.windsurfrules into your project');
   console.log('  - For DSH:       Installed in ~/.dsh/profiles/web/cordis.patch.yml, ~/.dsh/skills, ~/.dsh/AGENTS.md');
   console.log('  - For Codex/All: Copy prompts/AGENTS.md into your project\n');
+}
+
+async function handleHub(subArgs = []) {
+  const sub = subArgs[0] || 'status';
+  const asJson = subArgs.includes('--json');
+  const port = getHubPort();
+
+  if (sub === 'status') {
+    const health = await checkHubHealth({ port });
+    if (asJson) {
+      console.log(JSON.stringify(health || { ok: false, running: false, port }, null, 2));
+      return;
+    }
+    if (!health) {
+      console.log(`ChromeTether CDP Hub is currently stopped (port ${port}).`);
+      console.log('Run "node bin/chrometether.js hub start" to launch it.');
+      return;
+    }
+    console.log(`✔ ChromeTether CDP Hub v${health.version} running on 127.0.0.1:${health.port}`);
+    console.log(`  Mode:               ${health.mode}`);
+    console.log(`  Extension Connected:${health.extensionConnected ? ' yes' : ' no'}`);
+    console.log(`  Direct CDP Active:  ${health.directCdpConnected ? ' yes' : ' no'}`);
+    console.log(`  Active MCP Clients: ${health.mcpClientsCount}`);
+    console.log(`  Tracked Tabs:       ${health.tabsCount}`);
+    console.log(`  Containers:         ${health.containers?.length || 0}`);
+    return;
+  }
+
+  if (sub === 'start') {
+    const health = await ensureHubDaemon({ port });
+    if (asJson) {
+      console.log(JSON.stringify(health, null, 2));
+    } else {
+      console.log(`✔ ChromeTether CDP Hub started on 127.0.0.1:${health.port} (mode: ${health.mode})`);
+    }
+    return;
+  }
+
+  if (sub === 'stop') {
+    const res = await stopHubDaemon({ port });
+    if (asJson) {
+      console.log(JSON.stringify(res, null, 2));
+    } else if (res.stopped) {
+      console.log('✔ ChromeTether CDP Hub stopped.');
+    } else {
+      console.log('ℹ ChromeTether CDP Hub was not running.');
+    }
+    return;
+  }
+
+  if (sub === 'token') {
+    console.log(getOrCreateHubToken());
+    return;
+  }
+
+  showHelp();
+}
+
+function handleContainers(subArgs = []) {
+  const sub = subArgs[0] || 'list';
+  const asJson = subArgs.includes('--json');
+  const vault = new ContainerVault();
+
+  if (sub === 'list') {
+    const list = vault.listContainers();
+    if (asJson) {
+      console.log(JSON.stringify(list, null, 2));
+      return;
+    }
+    if (list.length === 0) {
+      console.log('No containers configured yet. Create one with: node bin/chrometether.js containers create acc-1 blue');
+      return;
+    }
+    for (const c of list) {
+      console.log(
+        `${c.badge} ${c.name.padEnd(16)} [MCP: ${c.mcpIsolatedContextName}] color=${c.color} cookies=${c.cookieCount} origins=${c.originsCount}`
+      );
+    }
+    return;
+  }
+
+  if (sub === 'create') {
+    const name = subArgs[1];
+    const color = subArgs[2];
+    if (!name) {
+      console.error('Usage: node bin/chrometether.js containers create <name> [color]');
+      process.exit(1);
+    }
+    const entry = vault.ensureContainer(name, { color });
+    const info = vault.listContainers().find(c => c.name === entry.name) || entry;
+    if (asJson) {
+      console.log(JSON.stringify(info, null, 2));
+    } else {
+      console.log(`✔ Container ready: ${info.badge} ${info.name} (MCP isolatedContext: ${info.mcpIsolatedContextName})`);
+    }
+    return;
+  }
+
+  if (sub === 'clear') {
+    const name = subArgs[1];
+    if (!name) {
+      console.error('Usage: node bin/chrometether.js containers clear <name>');
+      process.exit(1);
+    }
+    const ok = vault.clearContainer(name);
+    console.log(ok ? `✔ Cleared container "${name}".` : `ℹ Container "${name}" not found.`);
+    return;
+  }
+
+  if (sub === 'delete') {
+    const name = subArgs[1];
+    if (!name) {
+      console.error('Usage: node bin/chrometether.js containers delete <name>');
+      process.exit(1);
+    }
+    const ok = vault.deleteContainer(name);
+    console.log(ok ? `✔ Deleted container "${name}".` : `ℹ Container "${name}" not found.`);
+    return;
+  }
+
+  showHelp();
 }
 
 switch (command) {
@@ -320,11 +463,20 @@ switch (command) {
     handleInstall(nonFlagArgs[0] || 'all', flagArgs);
     break;
   }
+  case 'hub':
+    handleHub(args.slice(1));
+    break;
+  case 'containers':
+    handleContainers(args.slice(1));
+    break;
   case 'test':
     import('./test-connection.js');
     break;
   case 'start-reader':
     import('../src/reader-server/index.js');
+    break;
+  case 'start-containers':
+    import('../src/containers-server/index.js');
     break;
   case 'help':
   case '--help':

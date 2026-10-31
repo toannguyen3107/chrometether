@@ -23,6 +23,10 @@ export function getChromeDevToolsScript(projectDir = DEFAULT_PROJECT_DIR) {
   );
 }
 
+export function getCdpHubLauncherScript(projectDir = DEFAULT_PROJECT_DIR) {
+  return path.join(path.resolve(projectDir), 'src', 'cdp-hub', 'launcher.js');
+}
+
 export function getPinnedDevToolsVersion(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs } = {}) {
   try {
     const pkgPath = path.join(path.resolve(projectDir), 'package.json');
@@ -34,8 +38,24 @@ export function getPinnedDevToolsVersion(projectDir = DEFAULT_PROJECT_DIR, { fs 
   }
 }
 
-export function getChromeDevToolsLaunch(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs } = {}) {
+export function getChromeDevToolsLaunch(
+  projectDir = DEFAULT_PROJECT_DIR,
+  { fs = nodeFs, useHub } = {}
+) {
+  const launcherScript = getCdpHubLauncherScript(projectDir);
   const script = getChromeDevToolsScript(projectDir);
+  const hubAllowed =
+    useHub !== undefined
+      ? Boolean(useHub)
+      : process.env.CHROMETETHER_DISABLE_HUB !== '1' && fs.existsSync(launcherScript);
+
+  if (hubAllowed && fs.existsSync(launcherScript)) {
+    return {
+      command: getNodeCommand(),
+      args: [launcherScript]
+    };
+  }
+
   if (fs.existsSync(script)) {
     return {
       command: getNodeCommand(),
@@ -49,12 +69,13 @@ export function getChromeDevToolsLaunch(projectDir = DEFAULT_PROJECT_DIR, { fs =
   };
 }
 
-export function getServerLaunches(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs } = {}) {
+export function getServerLaunches(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs, useHub } = {}) {
   const normalizedProjectDir = path.resolve(projectDir);
   const nodeCmd = getNodeCommand();
   const readerScript = path.join(normalizedProjectDir, 'src', 'reader-server', 'index.js');
   const mapScript = path.join(normalizedProjectDir, 'src', 'app-map', 'server.js');
-  const devToolsLaunch = getChromeDevToolsLaunch(normalizedProjectDir, { fs });
+  const containersScript = path.join(normalizedProjectDir, 'src', 'containers-server', 'index.js');
+  const devToolsLaunch = getChromeDevToolsLaunch(normalizedProjectDir, { fs, useHub });
 
   return {
     'chrome-devtools': {
@@ -69,6 +90,10 @@ export function getServerLaunches(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeF
     'tether-map': {
       command: nodeCmd,
       args: [mapScript]
+    },
+    'tether-containers': {
+      command: nodeCmd,
+      args: [containersScript]
     }
   };
 }
@@ -76,11 +101,11 @@ export function getServerLaunches(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeF
 /**
  * Returns standard MCP server definitions for ChromeTether.
  * @param {string} [projectDir] - Absolute path to project root
- * @param {{ fs?: typeof nodeFs }} [options]
+ * @param {{ fs?: typeof nodeFs, useHub?: boolean }} [options]
  * @returns {object}
  */
-export function getBrowserMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs } = {}) {
-  const launches = getServerLaunches(projectDir, { fs });
+export function getBrowserMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs, useHub } = {}) {
+  const launches = getServerLaunches(projectDir, { fs, useHub });
   return {
     'chrome-devtools': {
       command: launches['chrome-devtools'].command,
@@ -93,6 +118,10 @@ export function getBrowserMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = no
     'tether-map': {
       command: launches['tether-map'].command,
       args: launches['tether-map'].args
+    },
+    'tether-containers': {
+      command: launches['tether-containers'].command,
+      args: launches['tether-containers'].args
     }
   };
 }
@@ -100,11 +129,11 @@ export function getBrowserMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = no
 /**
  * Returns OpenCode-formatted MCP server definitions.
  * @param {string} [projectDir]
- * @param {{ fs?: typeof nodeFs }} [options]
+ * @param {{ fs?: typeof nodeFs, useHub?: boolean }} [options]
  * @returns {object}
  */
-export function getOpenCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs } = {}) {
-  const launches = getServerLaunches(projectDir, { fs });
+export function getOpenCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs, useHub } = {}) {
+  const launches = getServerLaunches(projectDir, { fs, useHub });
   return {
     'chrome-devtools': {
       type: 'local',
@@ -120,6 +149,11 @@ export function getOpenCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = n
       type: 'local',
       command: [launches['tether-map'].command, ...launches['tether-map'].args],
       enabled: true
+    },
+    'tether-containers': {
+      type: 'local',
+      command: [launches['tether-containers'].command, ...launches['tether-containers'].args],
+      enabled: true
     }
   };
 }
@@ -127,11 +161,11 @@ export function getOpenCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = n
 /**
  * Returns ZCode-formatted MCP server definitions.
  * @param {string} [projectDir]
- * @param {{ fs?: typeof nodeFs }} [options]
+ * @param {{ fs?: typeof nodeFs, useHub?: boolean }} [options]
  * @returns {object}
  */
-export function getZCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs } = {}) {
-  const launches = getServerLaunches(projectDir, { fs });
+export function getZCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs, useHub } = {}) {
+  const launches = getServerLaunches(projectDir, { fs, useHub });
   return {
     'chrome-devtools': {
       type: 'stdio',
@@ -147,6 +181,11 @@ export function getZCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = node
       type: 'stdio',
       command: launches['tether-map'].command,
       args: launches['tether-map'].args
+    },
+    'tether-containers': {
+      type: 'stdio',
+      command: launches['tether-containers'].command,
+      args: launches['tether-containers'].args
     }
   };
 }
@@ -154,6 +193,8 @@ export function getZCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = node
 /**
  * Safely merges new MCP servers into an existing agent config file.
  * Creates an automatic backup (.bak) before modifying.
+ * Shallow-merges existing server objects so user-defined `env`, `disabled`, `timeout`,
+ * `alwaysAllow`, or `autoApprove` keys are preserved (Fixes Fable M4).
  * @param {string} configFilePath - Path to agent's config json
  * @param {object} serversToMerge - Object containing server definitions
  * @param {string|boolean} [format='standard'] - Format identifier ('standard', 'antigravity', 'opencode', 'zcode')
@@ -168,13 +209,16 @@ export function mergeMcpConfig(configFilePath, serversToMerge, format = 'standar
 
     const normalizedFormat = format === 'antigravity' ? 'standard' : format;
     const isZCode = normalizedFormat === 'zcode' || configFilePath.toLowerCase().includes('.zcode');
-    const isOpenCode = normalizedFormat === 'opencode' || normalizedFormat === true || configFilePath.toLowerCase().includes('opencode');
+    const isOpenCode =
+      normalizedFormat === 'opencode' ||
+      normalizedFormat === true ||
+      configFilePath.toLowerCase().includes('opencode');
 
     let currentConfig = {};
     if (isZCode) {
       currentConfig = { mcp: { servers: {} } };
     } else if (isOpenCode) {
-      currentConfig = { "$schema": "https://opencode.ai/config.json", mcp: {} };
+      currentConfig = { $schema: 'https://opencode.ai/config.json', mcp: {} };
     } else {
       currentConfig = { mcpServers: {} };
     }
@@ -197,7 +241,11 @@ export function mergeMcpConfig(configFilePath, serversToMerge, format = 'standar
           throw new Error('Existing mcp setting must be an object. The file was not changed.');
         }
         if (currentConfig.mcp.servers === undefined) currentConfig.mcp.servers = {};
-        else if (!currentConfig.mcp.servers || typeof currentConfig.mcp.servers !== 'object' || Array.isArray(currentConfig.mcp.servers)) {
+        else if (
+          !currentConfig.mcp.servers ||
+          typeof currentConfig.mcp.servers !== 'object' ||
+          Array.isArray(currentConfig.mcp.servers)
+        ) {
           throw new Error('Existing mcp.servers setting must be an object. The file was not changed.');
         }
       } else if (isOpenCode) {
@@ -207,7 +255,11 @@ export function mergeMcpConfig(configFilePath, serversToMerge, format = 'standar
         }
       } else {
         if (currentConfig.mcpServers === undefined) currentConfig.mcpServers = {};
-        else if (!currentConfig.mcpServers || typeof currentConfig.mcpServers !== 'object' || Array.isArray(currentConfig.mcpServers)) {
+        else if (
+          !currentConfig.mcpServers ||
+          typeof currentConfig.mcpServers !== 'object' ||
+          Array.isArray(currentConfig.mcpServers)
+        ) {
           throw new Error('Existing mcpServers setting must be an object. The file was not changed.');
         }
       }
@@ -228,7 +280,12 @@ export function mergeMcpConfig(configFilePath, serversToMerge, format = 'standar
       delete targetMap['agy-reader'];
     }
     for (const [key, val] of Object.entries(serversToMerge)) {
-      targetMap[key] = val;
+      const existingEntry = targetMap[key];
+      if (existingEntry && typeof existingEntry === 'object' && !Array.isArray(existingEntry)) {
+        targetMap[key] = { ...existingEntry, ...val };
+      } else {
+        targetMap[key] = val;
+      }
     }
 
     nodeFs.writeFileSync(configFilePath, JSON.stringify(currentConfig, null, 2), 'utf8');

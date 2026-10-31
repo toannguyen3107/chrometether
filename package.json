@@ -15,6 +15,8 @@
   "scripts": {
     "start-reader": "node src/reader-server/index.js",
     "start-map": "node src/app-map/server.js",
+    "start-containers": "node src/containers-server/index.js",
+    "start-hub": "node src/cdp-hub/server.js",
     "test": "node --test test/*.test.js",
     "test:network": "node test/smoke/reader-smoke.js && node bin/test-connection.js",
     "test-map": "node --test test/app-map.test.js",
@@ -41,7 +43,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1",
     "cheerio": "^1.0.0",
-    "chrome-devtools-mcp": "^1.9.0",
+    "chrome-devtools-mcp": "1.9.0",
     "turndown": "^7.2.0"
   }
 }

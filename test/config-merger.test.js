@@ -107,6 +107,43 @@ test('mergeMcpConfig preserves existing servers and writes timestamped backup', 
     assert.ok(updated.mcpServers['chrome-devtools']);
     assert.ok(updated.mcpServers['tether-reader']);
     assert.ok(updated.mcpServers['tether-map']);
+    assert.ok(updated.mcpServers['tether-containers']);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('mergeMcpConfig shallow-merges existing server entries to preserve user env and alwaysAllow settings (Fable M4)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chrometether-shallow-'));
+  try {
+    const mockConfigFile = path.join(tempDir, 'mock_config.json');
+    const initialConfig = {
+      mcpServers: {
+        'chrome-devtools': {
+          command: 'old-node',
+          args: ['old.js'],
+          env: { CUSTOM_FLAG: '1' },
+          alwaysAllow: ['list_pages', 'take_snapshot']
+        }
+      }
+    };
+    fs.writeFileSync(mockConfigFile, JSON.stringify(initialConfig, null, 2), 'utf8');
+
+    const servers = getBrowserMcpConfigs(path.resolve('.'));
+    const res = mergeMcpConfig(mockConfigFile, servers);
+    assert.equal(res.success, true);
+
+    const updated = JSON.parse(fs.readFileSync(mockConfigFile, 'utf8'));
+    assert.deepEqual(updated.mcpServers['chrome-devtools'].env, { CUSTOM_FLAG: '1' });
+    assert.deepEqual(updated.mcpServers['chrome-devtools'].alwaysAllow, [
+      'list_pages',
+      'take_snapshot'
+    ]);
+    assert.ok(
+      updated.mcpServers['chrome-devtools'].args[0].endsWith(
+        path.join('src', 'cdp-hub', 'launcher.js')
+      )
+    );
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
