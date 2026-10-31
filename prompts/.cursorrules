@@ -2,8 +2,9 @@
 
 When interacting with the web:
 - Tier 1: For reading text, docs, and blogs, use `read_url_content(url)` (lightweight, zero memory). Use `search_web(query, max_results, domain)` for internet queries.
-- Tier 2: For dynamic websites and web app testing, use `chrome-devtools`:
+- Tier 2: For dynamic websites and web app testing, use `chrome-devtools` (routed via the Local CDP Hub on `127.0.0.1:19222`):
   1. `navigate_page(url)`
   2. `take_snapshot()` -> Read element numeric `uid`s.
   3. `click(uid)` or `fill(uid, value)` using `uid`.
   4. `take_screenshot(filePath)` or `list_console_messages()` to inspect results — always pass `filePath` (avoids the 30s IPC timeout); keep Chrome unminimized.
+- Multi-Account Containers (`tether-containers`): Use `list_containers()`, `create_container(name, color)`, and `open_container_page(container, url, background)` (or `new_page(url, background, isolatedContext)`) for isolated multi-account tabs in the same Chrome window, and pass `pageId` to `take_snapshot(pageId)` / `click(uid, pageId)` / `fill(uid, value, pageId)`.

@@ -2,12 +2,13 @@ import nodeFs from 'fs';
 import { getAgentPaths } from './paths.js';
 import { parseJsonc } from './jsonc.js';
 
-export const TETHER_SERVER_KEYS = ['tether-reader', 'tether-map', 'agy-reader'];
+export const TETHER_SERVER_KEYS = ['tether-reader', 'tether-map', 'tether-containers', 'agy-reader'];
 export const DEVTOOLS_SERVER_KEYS = ['chrome-devtools', 'chrome_devtools'];
 
 const DSH_ID_MAP = {
   'mcp-tether-reader': 'tether-reader',
   'mcp-tether-map': 'tether-map',
+  'mcp-tether-containers': 'tether-containers',
   'mcp-chrome-devtools': 'chrome-devtools'
 };
 

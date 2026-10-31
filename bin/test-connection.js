@@ -71,7 +71,7 @@ function testMcpServer(command, args, label, timeoutMs = 15000) {
         capabilities: {},
         clientInfo: {
           name: 'chrometether-test-client',
-          version: '1.0.0'
+          version: '2.0.0'
         }
       }
     }) + '\n';
@@ -128,13 +128,23 @@ async function runHealthCheck() {
     console.error(`❌ tether-map MCP: FAILED (${err.message})`);
   }
 
-  // 4. Test Tier 2 Chrome DevTools MCP Stdio Transport
-  console.log('\n--- Checking Tier 2 Chrome DevTools MCP Engine ---');
+  // 4. Test Multi-Account Containers MCP Stdio Transport
+  console.log('\n--- Checking Multi-Account Containers MCP Server ---');
+  try {
+    const containersScript = path.join(projectDir, 'src', 'containers-server', 'index.js');
+    const res = await testMcpServer(nodeCmd, [containersScript], 'tether-containers MCP');
+    console.log(`✔ tether-containers Stdio MCP: OK (Protocol ${res.result.protocolVersion || 'v1'})`);
+  } catch (err) {
+    allPassed = false;
+    console.error(`❌ tether-containers MCP: FAILED (${err.message})`);
+  }
+
+  // 5. Test Tier 2 Chrome DevTools MCP Stdio Transport (via Local CDP Hub)
+  console.log('\n--- Checking Tier 2 Chrome DevTools MCP Engine (via Local CDP Hub) ---');
   try {
     const dtLaunch = getChromeDevToolsLaunch(projectDir);
-    const dtArgs = dtLaunch.args.map(a => a === '--auto-connect' ? '--headless=true' : a);
-    const res = await testMcpServer(dtLaunch.command, dtArgs, 'chrome-devtools-mcp');
-    console.log(`✔ chrome-devtools-mcp Stdio: OK (Protocol ${res.result.protocolVersion || 'v1'})`);
+    const res = await testMcpServer(dtLaunch.command, dtLaunch.args, 'chrome-devtools-mcp (CDP Hub)');
+    console.log(`✔ chrome-devtools-mcp + Local CDP Hub Stdio: OK (Protocol ${res.result.protocolVersion || 'v1'})`);
   } catch (err) {
     allPassed = false;
     console.error(`❌ chrome-devtools-mcp: FAILED (${err.message})`);

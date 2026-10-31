@@ -1,9 +1,10 @@
 <browser_guidelines>
 - When researching documentation or reading articles, always use Tier 1 lightweight tool: `read_url_content(url)` or `search_web(query, max_results, domain)`.
-- When interacting with live applications, SPAs, or debugging UI:
+- When interacting with live applications, SPAs, or debugging UI via `chrome-devtools` (connected through the Local CDP Hub on `127.0.0.1:19222`):
   1. Use `navigate_page(url)` to load the site.
   2. Use `take_snapshot()` to retrieve the Accessibility Tree.
   3. Locate the target element and its numeric `uid`.
   4. Perform actions via `click(uid)` or `fill(uid, value)`.
   5. Check `take_screenshot(filePath)` or `list_console_messages()` to verify UI changes and detect errors — always pass `filePath` (avoids the 30s IPC timeout); keep Chrome unminimized.
+- For multi-account or parallel sessions in the same Chrome window, use `tether-containers` (`list_containers`, `create_container`, `open_container_page`, `clear_container`) or `new_page(url, background, isolatedContext)` and pass `pageId` to all page tools.
 </browser_guidelines>

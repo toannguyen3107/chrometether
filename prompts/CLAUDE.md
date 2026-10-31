@@ -28,6 +28,14 @@ Use the Chrome DevTools MCP tools when the page is a dynamic Single Page App (Re
    - `list_console_messages()`: Verify no uncaught JavaScript errors or network failures.
    - `list_network_requests()`: Verify API responses (HTTP 200/404/500).
 
+## Multi-Account Container Tabs (Same Chrome Window) & Parallel Tasks
+
+When running multiple accounts on the same website or executing parallel browser tasks in the same Chrome window, use the `tether-containers` MCP tools together with `chrome-devtools` (routed through the Local CDP Hub on `127.0.0.1:19222`):
+- Call `list_containers()` to see existing persistent containers (including containers created manually in the ChromeTether extension popup) and their mapped `mcpIsolatedContextName` (`isolated-context-1`, `isolated-context-2`, ...).
+- Call `open_container_page(container, url, background)` (or `create_container(name, color)` followed by `new_page(url, background, isolatedContext)`) to open an isolated Container Tab in the **same Chrome window**.
+- Alternatively, pass `#tether-container=<name>` in the target URL (`new_page(url: "https://example.com#tether-container=acc-1")`).
+- Always pass `pageId` (from `list_pages()`) to `take_snapshot(pageId)`, `click(uid, pageId)`, `fill(uid, value, pageId)`, and `evaluate_script(function, args, pageId)` so parallel agents never steal focus from each other (`background: true`).
+
 ## Application mapping
 
 When exploring an application, start `tether-map` with `start_app_map(target_url)`. Record each visited page with `record_app_page`, then pass the request metadata observed through Chrome DevTools `list_network_requests` to `record_app_requests`. Call `get_app_map` to review the persistent page and endpoint map. Include only origins within the requested application.

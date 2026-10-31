@@ -21,7 +21,7 @@ test('prompts/AGENTS.md, rules/AGENTS.md, and root AGENTS.md are byte-identical'
   assert.equal(promptsAgents, rootAgents);
 });
 
-test('all prompt and skill files enforce take_screenshot(filePath) and 30s timeout guidance', () => {
+test('all prompt and skill files enforce take_screenshot(filePath), 30s timeout, and Multi-Account Container Hub guidance', () => {
   const files = [
     'prompts/AGENTS.md',
     'prompts/CLAUDE.md',
@@ -38,6 +38,8 @@ test('all prompt and skill files enforce take_screenshot(filePath) and 30s timeo
     assert.match(content, /filePath/, `${rel} must mention filePath`);
     assert.doesNotMatch(content, /take_screenshot\(\)/, `${rel} must not use bare take_screenshot()`);
     assert.match(content, /30000ms|30 ?s/, `${rel} must mention 30s / 30000ms timeout`);
+    assert.match(content, /tether-containers|open_container_page/, `${rel} must document tether-containers / open_container_page`);
+    assert.match(content, /pageId/, `${rel} must document passing pageId for multi-account/parallel tabs`);
   }
 });
 
