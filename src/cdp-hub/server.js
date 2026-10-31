@@ -190,7 +190,7 @@ export class CdpHubServer {
       }
     }
 
-    if (this.upstreamWsUrl || this.autoConnectDirectCdp) {
+    if (this.upstreamWsUrl) {
       this.ensureDirectUpstream().catch(() => {
         // Lazy retry on client command
       });
@@ -332,6 +332,7 @@ export class CdpHubServer {
           mode: this.mode,
           port: this.port,
           extensionConnected: Boolean(this.extSocket && this.extSocket.readyState === WS_STATE.OPEN),
+          trustedExtensionOrigin: this.trustedExtensionOrigin,
           directCdpConnected: Boolean(this.directWs && this.directWs.readyState === WS_STATE.OPEN),
           mcpClientsCount: this.mcpClients.size,
           tabsCount: this.tabs.size,
@@ -400,9 +401,16 @@ export class CdpHubServer {
 
     if (req.method === 'POST' && parsedUrl.pathname === '/containers') {
       const body = await this._readJsonBody(req);
-      const entry = this.vault.ensureContainer(body.name, { color: body.color });
+      const targetName = body.name || body.container || body.containerName;
+      const entry = this.vault.ensureContainer(targetName, { color: body.color });
       if (body.reserveNextContext !== false) {
         this.reserveNextContext(entry.name);
+      }
+      if (this.extSocket?.readyState === WS_STATE.OPEN) {
+        this._sendExtensionRequest('ensure_container', {
+          containerName: entry.name,
+          color: entry.color
+        }).catch(() => {});
       }
       const list = this.vault.listContainers();
       const info = list.find(c => c.name === entry.name) || entry;
@@ -413,7 +421,8 @@ export class CdpHubServer {
 
     if (req.method === 'POST' && parsedUrl.pathname === '/containers/open-tab') {
       const body = await this._readJsonBody(req);
-      const containerEntry = this.vault.ensureContainer(body.container || body.name, {
+      const targetName = body.container || body.name || body.containerName;
+      const containerEntry = this.vault.ensureContainer(targetName, {
         color: body.color
       });
       const url = body.url || 'about:blank';
@@ -443,12 +452,41 @@ export class CdpHubServer {
 
     if (req.method === 'POST' && parsedUrl.pathname === '/containers/clear') {
       const body = await this._readJsonBody(req);
-      const cleared = this.vault.clearContainer(body.name || body.container);
+      const targetName = body.name || body.container || body.containerName;
+      const cleared = this.vault.clearContainer(targetName);
       if (cleared) {
-        await this._syncContainerDnrRules(body.name || body.container);
+        await this._syncContainerDnrRules(targetName);
+        if (this.extSocket?.readyState === WS_STATE.OPEN) {
+          this._sendExtensionRequest('clear_container', {
+            containerName: targetName
+          }).catch(() => {});
+        }
       }
       res.statusCode = 200;
       res.end(JSON.stringify({ ok: true, cleared }));
+      return;
+    }
+
+    if (req.method === 'POST' && parsedUrl.pathname === '/containers/delete') {
+      const body = await this._readJsonBody(req);
+      const targetName = body.name || body.container || body.containerName;
+      const deleted = await this._deleteContainerAndCleanup(targetName, {
+        notifyExtension: true,
+        closeTabs: body.closeTabs !== false
+      });
+      res.statusCode = 200;
+      res.end(JSON.stringify({ ok: true, deleted }));
+      return;
+    }
+
+    if (req.method === 'POST' && parsedUrl.pathname === '/ext/reload') {
+      let reloaded = false;
+      if (this.extSocket?.readyState === WS_STATE.OPEN) {
+        await this._sendExtensionRequest('reload_extension', {}).catch(() => {});
+        reloaded = true;
+      }
+      res.statusCode = 200;
+      res.end(JSON.stringify({ ok: true, reloaded }));
       return;
     }
 
@@ -465,7 +503,10 @@ export class CdpHubServer {
 
     if (req.method === 'DELETE' && parsedUrl.pathname.startsWith('/containers/')) {
       const name = decodeURIComponent(parsedUrl.pathname.slice('/containers/'.length));
-      const deleted = this.vault.deleteContainer(name);
+      const deleted = await this._deleteContainerAndCleanup(name, {
+        notifyExtension: true,
+        closeTabs: true
+      });
       res.statusCode = 200;
       res.end(JSON.stringify({ ok: true, deleted }));
       return;
@@ -518,9 +559,7 @@ export class CdpHubServer {
   reserveNextContext(containerName) {
     const clean = normalizeContainerName(containerName);
     this.vault.ensureContainer(clean);
-    if (!this.pendingContextQueue.includes(clean)) {
-      this.pendingContextQueue.push(clean);
-    }
+    this.pendingContextQueue.push(clean);
     return clean;
   }
 
@@ -553,6 +592,7 @@ export class CdpHubServer {
         browserContextId,
         attachable,
         detachedFailClosed: false,
+        mainFrameId: `main-frame-${key}`,
         executionContexts: new Map(),
         frameTree: null,
         domainRefCounts: {
@@ -564,28 +604,16 @@ export class CdpHubServer {
           Performance: new Set()
         }
       };
-      // Seed default main-world execution context so Runtime.enable always has a context ready
-      tab.executionContexts.set(1, {
-        id: 1,
-        origin: tab.url || 'about:blank',
-        name: '',
-        uniqueId: `ctx-main-${key}`,
-        auxData: { isDefault: true, type: 'default', frameId: `main-frame-${key}` }
-      });
       this.tabs.set(key, tab);
     } else {
       tab.url = url ?? tab.url;
       tab.title = title || tab.title || tab.url;
       if (windowId !== undefined) tab.windowId = windowId;
-      if (containerName !== undefined && containerName !== null) {
+      if (containerName !== undefined) {
         tab.containerName = container ? container.name : null;
         tab.browserContextId = browserContextId;
       }
       tab.attachable = isAttachableTabUrl(tab.url);
-      const mainCtx = tab.executionContexts.get(1);
-      if (mainCtx) {
-        mainCtx.origin = tab.url || 'about:blank';
-      }
     }
     return tab;
   }
@@ -603,6 +631,27 @@ export class CdpHubServer {
       }
     }
     this.extSocket = ws;
+
+    // Close Phase 0 Direct-CDP connection and purge duplicate Direct-CDP tab entries
+    // so Extension and Direct-CDP never fight over debugger attachments on the same tabs.
+    if (this.directWs) {
+      const oldDirect = this.directWs;
+      this.directWs = null;
+      try {
+        oldDirect.close(1000, 'Superseded by ChromeTether Extension connection');
+      } catch {
+        // ignore
+      }
+      for (const pending of this._directPending.values()) {
+        pending.reject(new Error('Superseded by ChromeTether Extension connection'));
+      }
+      this._directPending.clear();
+    }
+    for (const [key, existing] of Array.from(this.tabs.entries())) {
+      if (existing.upstreamTargetId) {
+        this._handleTabClosed(key);
+      }
+    }
 
     ws.on('message', raw => {
       try {
@@ -695,6 +744,32 @@ export class CdpHubServer {
 
     if (msg.type === 'ext_sync_containers' && Array.isArray(msg.containers)) {
       let vaultChanged = false;
+      if (Array.isArray(msg.deleted)) {
+        for (const delName of msg.deleted) {
+          if (delName && this.vault.deleteContainer(delName)) {
+            vaultChanged = true;
+          }
+        }
+      }
+      if (msg.replace === true) {
+        const incomingNames = new Set();
+        for (const c of msg.containers) {
+          if (c?.name) {
+            try {
+              incomingNames.add(normalizeContainerName(c.name));
+            } catch {
+              // ignore
+            }
+          }
+        }
+        for (const existingName of Array.from(this.vault.containers.keys())) {
+          if (!incomingNames.has(existingName)) {
+            this.vault.deleteContainer(existingName);
+            this.pendingContextQueue = this.pendingContextQueue.filter(n => n !== existingName);
+            vaultChanged = true;
+          }
+        }
+      }
       for (const c of msg.containers) {
         if (!c?.name) continue;
         const entry = this.vault.ensureContainer(c.name, { color: c.color });
@@ -734,7 +809,13 @@ export class CdpHubServer {
     if (msg.type === 'ext_tabs_snapshot' && Array.isArray(msg.tabs)) {
       const seenKeys = new Set();
       for (const t of msg.tabs) {
-        const wasKnown = this.tabs.has(String(t.tabId));
+        const existingTab = this.tabs.get(String(t.tabId));
+        const wasKnown = Boolean(existingTab);
+        if (!wasKnown && this._pendingCreateTabCount > 0) {
+          seenKeys.add(String(t.tabId));
+          continue;
+        }
+        const prevContainer = existingTab?.containerName || null;
         const tab = this._ensureTabRecord({
           tabId: t.tabId,
           url: t.url,
@@ -745,10 +826,12 @@ export class CdpHubServer {
         seenKeys.add(tab.key);
         if (!wasKnown && tab.attachable) {
           this._broadcastNewTabToMcpClients(tab);
+        } else if (wasKnown && tab.attachable && prevContainer !== tab.containerName) {
+          this._broadcastTargetInfoChanged(tab);
         }
       }
       for (const [key, existing] of this.tabs.entries()) {
-        if (!seenKeys.has(key) && !existing.upstreamTargetId) {
+        if (!seenKeys.has(key) && !existing.upstreamTargetId && !this._pendingCreateTabCount) {
           this._handleTabClosed(key);
         }
       }
@@ -758,6 +841,9 @@ export class CdpHubServer {
     if (msg.type === 'ext_tab_updated' && msg.tab) {
       const t = msg.tab;
       const wasKnown = this.tabs.has(String(t.tabId));
+      if (!wasKnown && this._pendingCreateTabCount > 0) {
+        return;
+      }
       const tab = this._ensureTabRecord({
         tabId: t.tabId,
         url: t.url,
@@ -774,7 +860,20 @@ export class CdpHubServer {
     }
 
     if (msg.type === 'ext_tab_removed' && msg.tabId !== undefined) {
+      const closedTab = this.tabs.get(String(msg.tabId));
+      const prevContainer = closedTab?.containerName || null;
       this._handleTabClosed(String(msg.tabId));
+      if (prevContainer) {
+        const hasRemaining = Array.from(this.tabs.values()).some(
+          t => t.containerName === prevContainer
+        );
+        if (!hasRemaining) {
+          this._deleteContainerAndCleanup(prevContainer, {
+            notifyExtension: true,
+            closeTabs: false
+          }).catch(() => {});
+        }
+      }
       return;
     }
 
@@ -792,9 +891,16 @@ export class CdpHubServer {
 
     if (msg.type === 'ext_debugger_detached') {
       const tab = this.tabs.get(String(msg.tabId));
-      if (tab && tab.containerName) {
-        tab.detachedFailClosed = true;
-        this._syncTabDnrRules(tab, { failClosedBlocked: true }).catch(() => {});
+      if (tab) {
+        tab._extDebuggerAttached = false;
+        tab.executionContexts.clear();
+        for (const set of Object.values(tab.domainRefCounts)) {
+          set.clear();
+        }
+        if (tab.containerName && !msg.reattached) {
+          tab.detachedFailClosed = true;
+          this._syncTabDnrRules(tab, { failClosedBlocked: true }).catch(() => {});
+        }
       }
       return;
     }
@@ -810,6 +916,53 @@ export class CdpHubServer {
     if (msg.type === 'ext_popup_action') {
       this._handlePopupAction(msg).catch(() => {});
     }
+  }
+
+  async _deleteContainerAndCleanup(
+    rawName,
+    { notifyExtension = true, closeTabs = true } = {}
+  ) {
+    let name;
+    try {
+      name = normalizeContainerName(rawName);
+    } catch {
+      return false;
+    }
+    const deleted = this.vault.deleteContainer(name);
+    this.pendingContextQueue = this.pendingContextQueue.filter(n => n !== name);
+
+    for (const tab of Array.from(this.tabs.values())) {
+      if (tab.containerName === name) {
+        if (closeTabs) {
+          if (this.extSocket?.readyState === WS_STATE.OPEN && !tab.upstreamTargetId) {
+            await this._sendExtensionRequest('close_tab', {
+              tabId: Number(tab.tabId)
+            }).catch(() => {});
+          } else if (this.directWs?.readyState === WS_STATE.OPEN && tab.upstreamTargetId) {
+            await this._sendDirectCommand('Target.closeTarget', {
+              targetId: tab.upstreamTargetId
+            }).catch(() => {});
+          }
+          this._handleTabClosed(tab.key, { pruneEmptyContainer: false });
+        } else {
+          tab.containerName = null;
+          tab.browserContextId = undefined;
+          this._broadcastTargetInfoChanged(tab);
+        }
+      }
+    }
+
+    if (notifyExtension && this.extSocket?.readyState === WS_STATE.OPEN) {
+      await this._sendExtensionRequest(
+        'delete_container',
+        {
+          containerName: name,
+          closeTabs
+        },
+        1500
+      ).catch(() => {});
+    }
+    return deleted;
   }
 
   async _handlePopupAction(msg) {
@@ -843,6 +996,11 @@ export class CdpHubServer {
     } else if (msg.action === 'clear_container' && msg.containerName) {
       this.vault.clearContainer(msg.containerName);
       await this._syncContainerDnrRules(msg.containerName);
+    } else if (msg.action === 'delete_container' && msg.containerName) {
+      await this._deleteContainerAndCleanup(msg.containerName, {
+        notifyExtension: false,
+        closeTabs: true
+      });
     }
   }
 
@@ -856,6 +1014,21 @@ export class CdpHubServer {
 
   async _syncTabDnrRules(tab, { failClosedBlocked = false } = {}) {
     if (!tab.containerName) return;
+    const initScript = this.vault.buildInitScript(tab.containerName, {
+      sessionStorage: tab.sessionStorage || null
+    });
+    if (this.directWs?.readyState === WS_STATE.OPEN && tab.upstreamTargetId) {
+      if (tab._initScriptId) {
+        await this._forwardTabCdpCommand(tab, 'Page.removeScriptToEvaluateOnNewDocument', {
+          identifier: tab._initScriptId
+        }).catch(() => {});
+        tab._initScriptId = null;
+      }
+      const res = await this._forwardTabCdpCommand(tab, 'Page.addScriptToEvaluateOnNewDocument', {
+        source: initScript
+      }).catch(() => null);
+      if (res?.identifier) tab._initScriptId = res.identifier;
+    }
     if (!this.extSocket || this.extSocket.readyState !== WS_STATE.OPEN) return;
     const numericTabId = Number(tab.tabId);
     if (!Number.isInteger(numericTabId) || numericTabId <= 0) return;
@@ -867,7 +1040,8 @@ export class CdpHubServer {
       await this._sendExtensionRequest('update_tab_dnr_rules', {
         tabId: numericTabId,
         containerName: tab.containerName,
-        rules
+        rules,
+        initScript
       });
     } catch {
       // ignore if extension is reconnecting
@@ -879,6 +1053,9 @@ export class CdpHubServer {
   // ============================================================================
 
   async ensureDirectUpstream() {
+    if (this.extSocket && this.extSocket.readyState === WS_STATE.OPEN) {
+      return null;
+    }
     if (this.directWs && this.directWs.readyState === WS_STATE.OPEN) {
       return this.directWs;
     }
@@ -972,6 +1149,11 @@ export class CdpHubServer {
       return;
     }
 
+    // Ignore Direct-CDP target discovery events when the MV3 Companion Extension is connected
+    if (this.extSocket && this.extSocket.readyState === WS_STATE.OPEN) {
+      return;
+    }
+
     if (msg.method === 'Target.targetCreated' && msg.params?.targetInfo) {
       const info = msg.params.targetInfo;
       if (info.type === 'page') {
@@ -1008,6 +1190,20 @@ export class CdpHubServer {
       return;
     }
 
+    if (msg.method === 'Target.detachedFromTarget' && msg.params?.sessionId) {
+      for (const tab of this.tabs.values()) {
+        if (tab.upstreamSessionId === msg.params.sessionId) {
+          tab.upstreamSessionId = null;
+          tab.executionContexts.clear();
+          for (const set of Object.values(tab.domainRefCounts)) {
+            set.clear();
+          }
+          break;
+        }
+      }
+      return;
+    }
+
     // Event on an attached upstream target session
     if (msg.sessionId && msg.method) {
       for (const tab of this.tabs.values()) {
@@ -1033,21 +1229,27 @@ export class CdpHubServer {
 
     if (this.extSocket && this.extSocket.readyState === WS_STATE.OPEN) {
       const initScript = container ? this.vault.buildInitScript(container.name) : null;
-      const res = await this._sendExtensionRequest('create_tab', {
-        url: targetUrl,
-        background,
-        containerName: container ? container.name : null,
-        color: container ? container.color : null,
-        badge: container ? container.badge : null,
-        initScript
-      });
-      const tab = this._ensureTabRecord({
-        tabId: res.tabId,
-        url: res.url || targetUrl,
-        title: res.title || targetUrl,
-        windowId: res.windowId || 1,
-        containerName: container ? container.name : null
-      });
+      this._pendingCreateTabCount = (this._pendingCreateTabCount || 0) + 1;
+      let tab;
+      try {
+        const res = await this._sendExtensionRequest('create_tab', {
+          url: targetUrl,
+          background,
+          containerName: container ? container.name : null,
+          color: container ? container.color : null,
+          badge: container ? container.badge : null,
+          initScript
+        });
+        tab = this._ensureTabRecord({
+          tabId: res.tabId,
+          url: res.url || targetUrl,
+          title: res.title || targetUrl,
+          windowId: res.windowId || 1,
+          containerName: container ? container.name : null
+        });
+      } finally {
+        this._pendingCreateTabCount = Math.max(0, (this._pendingCreateTabCount || 1) - 1);
+      }
       if (container) {
         await this._syncTabDnrRules(tab);
       }
@@ -1114,13 +1316,38 @@ export class CdpHubServer {
       name: '__chrometether_vault_sync'
     }).catch(() => {});
     await this._forwardTabCdpCommand(tab, 'Page.enable', {}).catch(() => {});
-    await this._forwardTabCdpCommand(tab, 'Page.addScriptToEvaluateOnNewDocument', {
+    if (tab._initScriptId) {
+      await this._forwardTabCdpCommand(tab, 'Page.removeScriptToEvaluateOnNewDocument', {
+        identifier: tab._initScriptId
+      }).catch(() => {});
+      tab._initScriptId = null;
+    }
+    const res = await this._forwardTabCdpCommand(tab, 'Page.addScriptToEvaluateOnNewDocument', {
       source: initScript
-    }).catch(() => {});
+    }).catch(() => null);
+    if (res?.identifier) tab._initScriptId = res.identifier;
   }
 
   async _forwardTabCdpCommand(tab, method, params = {}) {
     if (this.extSocket && this.extSocket.readyState === WS_STATE.OPEN && !tab.upstreamTargetId) {
+      while (!tab._extDebuggerAttached && tab._extAttachGate) {
+        await tab._extAttachGate.catch(() => {});
+      }
+      if (!tab._extDebuggerAttached) {
+        const p = this._sendExtensionRequest('cdp_command', {
+          tabId: Number(tab.tabId),
+          method,
+          params
+        });
+        tab._extAttachGate = p;
+        try {
+          const res = await p;
+          tab._extDebuggerAttached = true;
+          return res;
+        } finally {
+          if (tab._extAttachGate === p) tab._extAttachGate = null;
+        }
+      }
       return this._sendExtensionRequest('cdp_command', {
         tabId: Number(tab.tabId),
         method,
@@ -1187,10 +1414,16 @@ export class CdpHubServer {
     // Cache Runtime execution contexts for secondary session replay (Fixes Fable H1)
     if (method === 'Runtime.executionContextCreated' && params.context) {
       tab.executionContexts.set(params.context.id, params.context);
+      if (params.context.auxData?.isDefault && params.context.auxData?.frameId) {
+        tab.mainFrameId = params.context.auxData.frameId;
+      }
     } else if (method === 'Runtime.executionContextDestroyed' && params.executionContextId) {
       tab.executionContexts.delete(params.executionContextId);
     } else if (method === 'Runtime.executionContextsCleared') {
       tab.executionContexts.clear();
+    } else if (method === 'Page.frameNavigated' && params.frame && !params.frame.parentId) {
+      tab.mainFrameId = params.frame.id;
+      tab.url = params.frame.url || tab.url;
     }
 
     // Handle in-page ContainerVault sync binding calls
@@ -1216,29 +1449,52 @@ export class CdpHubServer {
         }
 
         if (data.type === 'setCookie' && data.cookie) {
-          const targetUrl = trustedOrigin ? tab.url : data.url || tab.url;
+          let targetUrl = data.url || tab.url;
+          if (trustedOrigin) {
+            if (typeof data.url === 'string' && data.url.startsWith(trustedOrigin)) {
+              targetUrl = data.url;
+            } else if (typeof tab.url === 'string' && tab.url.startsWith(trustedOrigin)) {
+              targetUrl = tab.url;
+            } else {
+              targetUrl = `${trustedOrigin}/`;
+            }
+          }
           this.vault.applySetCookieHeaders(cName, [data.cookie], targetUrl);
           this._syncContainerDnrRules(cName).catch(() => {});
         } else if (data.type === 'storageSet') {
           const effectiveOrigin = trustedOrigin || data.origin;
           if (effectiveOrigin) {
+            if (data.session) {
+              if (!tab.sessionStorage) tab.sessionStorage = {};
+              if (!tab.sessionStorage[effectiveOrigin]) tab.sessionStorage[effectiveOrigin] = {};
+              tab.sessionStorage[effectiveOrigin][String(data.key)] = String(data.value);
+            }
             this.vault.setStorageItem(cName, effectiveOrigin, data.key, data.value, {
               session: Boolean(data.session)
             });
+            this._syncContainerDnrRules(cName).catch(() => {});
           }
         } else if (data.type === 'storageRemove') {
           const effectiveOrigin = trustedOrigin || data.origin;
           if (effectiveOrigin) {
+            if (data.session && tab.sessionStorage?.[effectiveOrigin]) {
+              delete tab.sessionStorage[effectiveOrigin][String(data.key)];
+            }
             this.vault.removeStorageItem(cName, effectiveOrigin, data.key, {
               session: Boolean(data.session)
             });
+            this._syncContainerDnrRules(cName).catch(() => {});
           }
         } else if (data.type === 'storageClear') {
           const effectiveOrigin = trustedOrigin || data.origin;
           if (effectiveOrigin) {
+            if (data.session && tab.sessionStorage) {
+              delete tab.sessionStorage[effectiveOrigin];
+            }
             this.vault.clearStorageOrigin(cName, effectiveOrigin, {
               session: Boolean(data.session)
             });
+            this._syncContainerDnrRules(cName).catch(() => {});
           }
         }
       } catch {
@@ -1392,6 +1648,21 @@ export class CdpHubServer {
   _broadcastNewTabToMcpClients(tab) {
     if (!tab.attachable) return;
     for (const client of this.mcpClients.values()) {
+      let alreadyAttached = false;
+      for (const sInfo of client.sessions.values()) {
+        if (sInfo.tabKey === tab.key && sInfo.kind === 'tab') {
+          alreadyAttached = true;
+          break;
+        }
+      }
+      if (alreadyAttached) {
+        if (client.discoverTargets || client.autoAttach) {
+          this._sendMcpEvent(client, 'Target.targetInfoChanged', {
+            targetInfo: this._buildTargetInfo(tab, 'page')
+          });
+        }
+        continue;
+      }
       if (client.discoverTargets) {
         this._sendMcpEvent(client, 'Target.targetCreated', {
           targetInfo: this._buildTargetInfo(tab, 'page')
@@ -1419,9 +1690,10 @@ export class CdpHubServer {
     }
   }
 
-  _handleTabClosed(tabKey) {
+  _handleTabClosed(tabKey, { pruneEmptyContainer = true } = {}) {
     const tab = this.tabs.get(String(tabKey));
     if (!tab) return;
+    const prevContainer = tab.containerName || null;
     this.tabs.delete(String(tabKey));
 
     for (const client of this.mcpClients.values()) {
@@ -1441,6 +1713,18 @@ export class CdpHubServer {
         this._sendMcpEvent(client, 'Target.targetDestroyed', {
           targetId: tab.tabTargetId
         });
+      }
+    }
+
+    if (pruneEmptyContainer && prevContainer) {
+      const hasRemaining = Array.from(this.tabs.values()).some(
+        t => t.containerName === prevContainer
+      );
+      if (!hasRemaining) {
+        this._deleteContainerAndCleanup(prevContainer, {
+          notifyExtension: true,
+          closeTabs: false
+        }).catch(() => {});
       }
     }
   }
@@ -1521,10 +1805,69 @@ export class CdpHubServer {
       }
       const entry = this.vault.ensureContainer(containerName, { color: params.color });
       this._sendMcpResponse(client, id, { browserContextId: entry.contextId });
+
+      // If this MCP client already had open tabs attached under `entry.contextId`
+      // (e.g. opened earlier via `open_container_page`), Puppeteer's `createBrowserContext`
+      // overwrites its internal `CdpBrowserContext` instance for `entry.contextId`.
+      // Re-announce those existing tabs to `client` so they bind to the new `CdpBrowserContext`.
+      const existingTabsForClient = Array.from(this.tabs.values()).filter(t => {
+        if (!t.attachable || t.browserContextId !== entry.contextId) return false;
+        for (const sInfo of client.sessions.values()) {
+          if (sInfo.tabKey === t.key) return true;
+        }
+        return false;
+      });
+      if (existingTabsForClient.length > 0) {
+        setImmediate(() => {
+          for (const existingTab of existingTabsForClient) {
+            if (!this.tabs.has(existingTab.key)) continue;
+            for (const [vSessionId, sInfo] of client.sessions.entries()) {
+              if (sInfo.tabKey === existingTab.key) {
+                this._sendMcpEvent(client, 'Target.detachedFromTarget', {
+                  sessionId: vSessionId,
+                  targetId:
+                    sInfo.kind === 'tab' ? existingTab.tabTargetId : existingTab.pageTargetId
+                });
+                client.sessions.delete(vSessionId);
+              }
+            }
+            if (client.discoverTargets || client.autoAttach) {
+              this._sendMcpEvent(client, 'Target.targetDestroyed', {
+                targetId: existingTab.pageTargetId
+              });
+              this._sendMcpEvent(client, 'Target.targetDestroyed', {
+                targetId: existingTab.tabTargetId
+              });
+            }
+            if (client.discoverTargets) {
+              this._sendMcpEvent(client, 'Target.targetCreated', {
+                targetInfo: this._buildTargetInfo(existingTab, 'page')
+              });
+            }
+            if (client.autoAttach) {
+              const { tabSessionId } = this._ensureClientTabAndPageSessions(client, existingTab);
+              this._sendMcpEvent(client, 'Target.attachedToTarget', {
+                sessionId: tabSessionId,
+                targetInfo: this._buildTargetInfo(existingTab, 'tab'),
+                waitingForDebugger: false
+              });
+            }
+          }
+        });
+      }
       return;
     }
 
     if (method === 'Target.disposeBrowserContext') {
+      if (params.browserContextId) {
+        const container = this.vault.getContainerByContextId(params.browserContextId);
+        if (container) {
+          await this._deleteContainerAndCleanup(container.name, {
+            notifyExtension: true,
+            closeTabs: true
+          });
+        }
+      }
       this._sendMcpResponse(client, id, {});
       return;
     }
@@ -1702,22 +2045,41 @@ export class CdpHubServer {
     if (action === 'enable' && tab.domainRefCounts[domain]) {
       const refSet = tab.domainRefCounts[domain];
       const wasEmpty = refSet.size === 0;
-      refSet.add(sessionId);
+      const hasRealUpstream =
+        (this.extSocket && this.extSocket.readyState === WS_STATE.OPEN && !tab.upstreamTargetId) ||
+        (this.directWs && this.directWs.readyState === WS_STATE.OPEN && tab.upstreamTargetId);
 
-      if (wasEmpty) {
-        await this._forwardTabCdpCommand(tab, method, params).catch(() => {});
-      }
-      this._sendMcpResponse(client, id, {}, sessionId);
-
-      // Replay cached Runtime.executionContextCreated events to this session!
       if (domain === 'Runtime') {
-        if (tab.executionContexts.size === 0) {
+        if (hasRealUpstream && (wasEmpty || tab.executionContexts.size === 0)) {
+          if (!tab._runtimeEnablePromise) {
+            tab._runtimeEnablePromise = (async () => {
+              try {
+                tab.executionContexts.clear();
+                await this._forwardTabCdpCommand(tab, 'Runtime.disable', {}).catch(() => {});
+                await this._forwardTabCdpCommand(tab, 'Runtime.enable', params).catch(() => {});
+                if (tab.containerName) {
+                  await this._forwardTabCdpCommand(tab, 'Runtime.addBinding', {
+                    name: '__chrometether_vault_sync'
+                  }).catch(() => {});
+                }
+              } finally {
+                tab._runtimeEnablePromise = null;
+              }
+            })();
+          }
+          await tab._runtimeEnablePromise;
+        }
+        refSet.add(sessionId);
+        this._sendMcpResponse(client, id, {}, sessionId);
+
+        if (!hasRealUpstream && tab.executionContexts.size === 0) {
+          const fallbackFrameId = tab.mainFrameId || `main-frame-${tab.key}`;
           tab.executionContexts.set(1, {
             id: 1,
             origin: tab.url || 'about:blank',
             name: '',
             uniqueId: `ctx-main-${tab.key}`,
-            auxData: { isDefault: true, type: 'default', frameId: `main-frame-${tab.key}` }
+            auxData: { isDefault: true, type: 'default', frameId: fallbackFrameId }
           });
         }
         for (const ctx of tab.executionContexts.values()) {
@@ -1728,7 +2090,14 @@ export class CdpHubServer {
             sessionId
           );
         }
+        return;
       }
+
+      if (wasEmpty) {
+        await this._forwardTabCdpCommand(tab, method, params).catch(() => {});
+      }
+      refSet.add(sessionId);
+      this._sendMcpResponse(client, id, {}, sessionId);
       return;
     }
 
@@ -1747,6 +2116,35 @@ export class CdpHubServer {
       return;
     }
 
+    if (method === 'Page.bringToFront') {
+      if (this.extSocket && this.extSocket.readyState === WS_STATE.OPEN && !tab.upstreamTargetId) {
+        await this._sendExtensionRequest('activate_tab', {
+          tabId: Number(tab.tabId)
+        }).catch(() => {});
+        this._sendMcpResponse(client, id, {}, sessionId);
+        return;
+      }
+    }
+
+    if (method === 'Page.setLifecycleEventsEnabled') {
+      if (params?.enabled) {
+        await this._forwardTabCdpCommand(tab, 'Page.enable', {}).catch(() => {});
+      }
+      const res = await this._forwardTabCdpCommand(tab, method, params).catch(() => ({}));
+      this._sendMcpResponse(client, id, res || {}, sessionId);
+      return;
+    }
+
+    if (method === 'Page.getFrameTree') {
+      const res = await this._forwardTabCdpCommand(tab, method, params);
+      if (res?.frameTree?.frame?.id) {
+        tab.mainFrameId = res.frameTree.frame.id;
+        tab.frameTree = res.frameTree;
+      }
+      this._sendMcpResponse(client, id, res || {}, sessionId);
+      return;
+    }
+
     if (method === 'Page.navigate') {
       const hint = extractUrlContainerHint(params.url);
       let targetUrl = hint.cleanUrl || params.url;
@@ -1754,7 +2152,9 @@ export class CdpHubServer {
         const entry = this.vault.ensureContainer(hint.containerName);
         tab.containerName = entry.name;
         tab.browserContextId = entry.contextId;
-        await this._configureContainerOnUpstreamSession(tab);
+        if (tab.upstreamTargetId) {
+          await this._configureContainerOnUpstreamSession(tab);
+        }
         await this._syncTabDnrRules(tab);
         if (this.extSocket?.readyState === WS_STATE.OPEN && !tab.upstreamTargetId) {
           await this._sendExtensionRequest('assign_tab_container', {
@@ -1766,6 +2166,8 @@ export class CdpHubServer {
             dnrRules: this.vault.buildDnrSessionRulesForTab(entry.name, Number(tab.tabId))
           }).catch(() => {});
         }
+      } else if (tab.containerName) {
+        await this._syncTabDnrRules(tab);
       }
 
       const navRes = await this._forwardTabCdpCommand(tab, 'Page.navigate', {
@@ -1783,13 +2185,13 @@ export class CdpHubServer {
         id,
         navRes && navRes.frameId
           ? navRes
-          : { frameId: `main-frame-${tab.key}`, loaderId: `loader-${tab.key}` },
+          : { frameId: tab.mainFrameId || `main-frame-${tab.key}`, loaderId: `loader-${tab.key}` },
         sessionId
       );
 
       // Emit lifecycle events so Puppeteer's Page.navigate resolves promptly in standby/virtual mode
       if (!tab.upstreamTargetId && (!this.extSocket || this.extSocket.readyState !== WS_STATE.OPEN)) {
-        const frameId = `main-frame-${tab.key}`;
+        const frameId = tab.mainFrameId || `main-frame-${tab.key}`;
         const loaderId = `loader-${tab.key}`;
         this._sendMcpEvent(
           client,
@@ -1819,13 +2221,34 @@ export class CdpHubServer {
     }
 
     if (method === 'Page.close') {
+      if (this.extSocket?.readyState === WS_STATE.OPEN && !tab.upstreamTargetId) {
+        await this._sendExtensionRequest('close_tab', {
+          tabId: Number(tab.tabId)
+        }).catch(() => {});
+      } else if (this.directWs?.readyState === WS_STATE.OPEN && tab.upstreamTargetId) {
+        await this._sendDirectCommand('Target.closeTarget', {
+          targetId: tab.upstreamTargetId
+        }).catch(() => {});
+      }
       this._handleTabClosed(tab.key);
       this._sendMcpResponse(client, id, {}, sessionId);
       return;
     }
 
-    const res = await this._forwardTabCdpCommand(tab, method, params);
-    this._sendMcpResponse(client, id, res || {}, sessionId);
+    if (method === 'Page.reload' && tab.containerName) {
+      await this._syncTabDnrRules(tab);
+    }
+
+    try {
+      const res = await this._forwardTabCdpCommand(tab, method, params);
+      this._sendMcpResponse(client, id, res || {}, sessionId);
+    } catch (err) {
+      if (/Cannot find context with specified id/i.test(String(err?.message || ''))) {
+        tab.executionContexts.clear();
+        this._forwardTabCdpCommand(tab, 'Runtime.enable', {}).catch(() => {});
+      }
+      throw err;
+    }
   }
 }
 

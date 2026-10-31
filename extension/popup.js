@@ -1,3 +1,13 @@
+if (window.location.search.includes('autoreload=1')) {
+  chrome.tabs.getCurrent(tab => {
+    if (tab?.id) {
+      chrome.tabs.remove(tab.id, () => chrome.runtime.reload());
+    } else {
+      chrome.runtime.reload();
+    }
+  });
+}
+
 const statusPillEl = document.getElementById('hub-status');
 const statusTextEl = document.getElementById('hub-status-text');
 const activeTabHostEl = document.getElementById('active-tab-host');
@@ -324,7 +334,16 @@ convertBtn.addEventListener('click', async () => {
 });
 
 refreshActiveTabInfo();
+chrome.runtime.onMessage.addListener(msg => {
+  if (msg?.type === 'popup_state_updated' && msg.state) {
+    renderState(msg.state);
+  }
+});
 chrome.runtime.sendMessage({ type: 'popup_get_state' }, res => {
+  if (res && !res.bgVersion) {
+    chrome.runtime.reload();
+    return;
+  }
   renderState(res || {});
   if (Array.isArray(res?.containers) && res.containers.length > 0) {
     suggestNextContainerDefaults(res.containers);

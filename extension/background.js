@@ -31,8 +31,21 @@ let hubToken = null;
 // containerName -> { name, color, badge, createdAt, cookies: [], localStorage: {}, sessionStorage: {} }
 const localVault = new Map();
 
-// tabId (number) -> { containerName, color, badge }
+// tabId (number) -> { containerName, color, badge, groupId, groupingInProgress }
 const tabContainers = new Map();
+
+// groupId (number) -> containerName (string)
+const groupContainers = new Map();
+
+// Tombstone set of deleted container names so Hub reconnect never resurrects deleted containers
+const deletedContainerNames = new Set();
+
+// Guard set to prevent re-entrant delete loops while closing group/container tabs
+const removingContainers = new Set();
+
+// Guard counter and set to prevent premature ext_tab_updated / onCreated races during programmatic tab creation
+let creatingTabCount = 0;
+const initializingTabs = new Set();
 
 // Set of tabIds with active chrome.debugger attachment
 const attachedTabs = new Set();
@@ -142,6 +155,7 @@ function parseSetCookieHeaderLocal(setCookieStr, requestUrl) {
 
 function ensureContainerInLocalVault(rawName, color = 'blue') {
   const name = normalizeName(rawName);
+  deletedContainerNames.delete(name);
   let entry = localVault.get(name);
   if (!entry) {
     const chosenColor = COLOR_BADGES[color] ? color : 'blue';
@@ -275,7 +289,7 @@ function buildDnrRulesForLocalContainerTab(containerName, tabId, { failClosedBlo
   return rules;
 }
 
-function buildInitScriptForLocalContainer(containerName) {
+function buildInitScriptForLocalContainer(containerName, customSessionStorage = null) {
   const entry = ensureContainerInLocalVault(containerName);
   const now = Date.now();
   const jsCookies = entry.cookies
@@ -295,7 +309,7 @@ function buildInitScriptForLocalContainer(containerName) {
     container: entry.name,
     cookies: jsCookies,
     localStorage: entry.localStorage || {},
-    sessionStorage: entry.sessionStorage || {}
+    sessionStorage: customSessionStorage || entry.sessionStorage || {}
   });
 
   return `(() => {
@@ -308,12 +322,51 @@ function buildInitScriptForLocalContainer(containerName) {
   const rawSyncBinding = typeof window.__chrometether_vault_sync === 'function'
     ? window.__chrometether_vault_sync
     : null;
+  let activeSyncBinding = rawSyncBinding;
   try { delete window.__chrometether_vault_sync; } catch {}
+  const getSyncBinding = () => {
+    if (typeof window.__chrometether_vault_sync === 'function') {
+      activeSyncBinding = window.__chrometether_vault_sync;
+      try { delete window.__chrometether_vault_sync; } catch {}
+    }
+    return activeSyncBinding;
+  };
   const state = ${payload};
+  try {
+    defineProperty(window, '__chrometether_receive_state', {
+      value: (incoming) => {
+        if (!incoming || typeof incoming !== 'object') return;
+        if (Array.isArray(incoming.cookies)) {
+          state.cookies.length = 0;
+          for (const c of incoming.cookies) state.cookies.push(c);
+        }
+        if (incoming.localStorage && typeof incoming.localStorage === 'object') {
+          for (const k of objectKeys(state.localStorage)) {
+            if (!hasOwn.call(incoming.localStorage, k)) delete state.localStorage[k];
+          }
+          for (const origin of objectKeys(incoming.localStorage)) {
+            const srcBucket = incoming.localStorage[origin] || {};
+            if (!state.localStorage[origin]) state.localStorage[origin] = {};
+            const dstBucket = state.localStorage[origin];
+            for (const bk of objectKeys(dstBucket)) {
+              if (!hasOwn.call(srcBucket, bk)) delete dstBucket[bk];
+            }
+            for (const bk of objectKeys(srcBucket)) {
+              dstBucket[bk] = srcBucket[bk];
+            }
+          }
+        }
+      },
+      configurable: false,
+      enumerable: false,
+      writable: false
+    });
+  } catch {}
   const notify = (msg) => {
     try {
-      if (rawSyncBinding) {
-        rawSyncBinding(jsonStringify({ container: state.container, ...msg }));
+      const fn = getSyncBinding();
+      if (fn) {
+        fn(jsonStringify({ container: state.container, ...msg }));
       }
     } catch {}
   };
@@ -436,12 +489,22 @@ function buildInitScriptForLocalContainer(containerName) {
 
 async function restoreSessionState() {
   try {
-    const localData = await chrome.storage.local.get(['containersVault']);
+    const localData = await chrome.storage.local.get([
+      'containersVault',
+      'deletedContainerNames'
+    ]);
+    if (Array.isArray(localData?.deletedContainerNames)) {
+      for (const name of localData.deletedContainerNames) {
+        if (name) deletedContainerNames.add(normalizeName(name));
+      }
+    }
     if (Array.isArray(localData?.containersVault)) {
       for (const c of localData.containersVault) {
         if (!c?.name) continue;
-        localVault.set(c.name, {
-          name: c.name,
+        const name = normalizeName(c.name);
+        if (deletedContainerNames.has(name)) continue;
+        localVault.set(name, {
+          name,
           color: c.color || 'blue',
           badge: COLOR_BADGES[c.color] || '🔵',
           createdAt: c.createdAt || Date.now(),
@@ -456,11 +519,13 @@ async function restoreSessionState() {
       for (const [k, v] of Object.entries(sessData.tabContainers)) {
         const tabId = Number(k);
         if (Number.isInteger(tabId) && v?.containerName) {
-          tabContainers.set(tabId, v);
-          ensureContainerInLocalVault(v.containerName, v.color);
+          const name = normalizeName(v.containerName);
+          if (deletedContainerNames.has(name)) continue;
+          tabContainers.set(tabId, { ...v, containerName: name });
         }
       }
     }
+    await reconcileTabsAndGroupsWithChrome();
   } catch {
     // ignore
   }
@@ -476,7 +541,10 @@ async function persistVaultAndTabs() {
       cookies: c.cookies,
       localStorage: c.localStorage
     }));
-    await chrome.storage.local.set({ containersVault });
+    await chrome.storage.local.set({
+      containersVault,
+      deletedContainerNames: Array.from(deletedContainerNames)
+    });
 
     const serializedTabs = {};
     for (const [tabId, info] of tabContainers.entries()) {
@@ -509,6 +577,23 @@ function getContainerSummaries() {
   });
 }
 
+function broadcastPopupState() {
+  try {
+    chrome.runtime
+      .sendMessage({
+        type: 'popup_state_updated',
+        state: {
+          connected: Boolean(ws && ws.readyState === WebSocket.OPEN),
+          containers: getContainerSummaries(),
+          activeContainerTabsCount: tabContainers.size
+        }
+      })
+      .catch(() => {});
+  } catch {
+    // ignore when popup is closed
+  }
+}
+
 function sendToHub(payload) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     try {
@@ -521,7 +606,7 @@ function sendToHub(payload) {
   return false;
 }
 
-function syncLocalVaultToHub() {
+function syncLocalVaultToHub({ replace = false } = {}) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const containers = Array.from(localVault.values()).map(c => ({
     name: c.name,
@@ -530,7 +615,177 @@ function syncLocalVaultToHub() {
     cookies: c.cookies,
     localStorage: c.localStorage
   }));
-  sendToHub({ type: 'ext_sync_containers', containers });
+  sendToHub({
+    type: 'ext_sync_containers',
+    containers,
+    replace,
+    deleted: Array.from(deletedContainerNames)
+  });
+}
+
+async function reconcileTabsAndGroupsWithChrome() {
+  try {
+    const [allTabs, allGroups] = await Promise.all([
+      chrome.tabs.query({}),
+      chrome.tabGroups.query({})
+    ]);
+    const liveTabMap = new Map(allTabs.map(t => [t.id, t]));
+    const liveGroupMap = new Map(allGroups.map(g => [g.id, g]));
+
+    for (const gId of Array.from(groupContainers.keys())) {
+      if (!liveGroupMap.has(gId)) {
+        groupContainers.delete(gId);
+      }
+    }
+    for (const g of allGroups) {
+      if (g.title) {
+        const cleanTitle = normalizeName(g.title);
+        if (localVault.has(cleanTitle) && !deletedContainerNames.has(cleanTitle)) {
+          groupContainers.set(g.id, cleanTitle);
+        }
+      }
+    }
+
+    let changed = false;
+    for (const [tabId, info] of Array.from(tabContainers.entries())) {
+      const liveTab = liveTabMap.get(tabId);
+      if (!liveTab || deletedContainerNames.has(info.containerName)) {
+        tabContainers.delete(tabId);
+        attachedTabs.delete(tabId);
+        attachingTabs.delete(tabId);
+        await clearTabDnrSessionRules(tabId);
+        changed = true;
+      } else if (!info.groupingInProgress && (liveTab.groupId === undefined || liveTab.groupId === -1)) {
+        tabContainers.delete(tabId);
+        await clearTabDnrSessionRules(tabId);
+        changed = true;
+      } else if (liveTab.groupId > 0) {
+        info.groupId = liveTab.groupId;
+        groupContainers.set(liveTab.groupId, info.containerName);
+        if (!localVault.has(info.containerName) && !deletedContainerNames.has(info.containerName)) {
+          ensureContainerInLocalVault(info.containerName, info.color);
+          changed = true;
+        }
+      }
+    }
+
+    for (const liveTab of allTabs) {
+      if (!tabContainers.has(liveTab.id) && liveTab.groupId > 0) {
+        const cName = groupContainers.get(liveTab.groupId);
+        if (cName && localVault.has(cName) && !deletedContainerNames.has(cName)) {
+          const entry = localVault.get(cName);
+          tabContainers.set(liveTab.id, {
+            containerName: entry.name,
+            color: entry.color,
+            badge: entry.badge,
+            groupId: liveTab.groupId,
+            initScript: buildInitScriptForLocalContainer(entry.name)
+          });
+          changed = true;
+        }
+      }
+    }
+
+    const activeContainerNames = new Set();
+    for (const info of tabContainers.values()) {
+      if (info.containerName) activeContainerNames.add(info.containerName);
+    }
+    for (const cName of groupContainers.values()) {
+      if (cName) activeContainerNames.add(cName);
+    }
+    const now = Date.now();
+    for (const [cName, entry] of Array.from(localVault.entries())) {
+      if (!activeContainerNames.has(cName) && now - (entry.createdAt || 0) > 60000) {
+        localVault.delete(cName);
+        deletedContainerNames.add(cName);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await persistVaultAndTabs();
+      syncLocalVaultToHub({ replace: true });
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function deleteContainerLocal(
+  rawName,
+  { notifyHub = true, closeTabs = true } = {}
+) {
+  const name = normalizeName(rawName);
+  if (removingContainers.has(name)) return;
+  removingContainers.add(name);
+  try {
+    deletedContainerNames.add(name);
+    localVault.delete(name);
+
+    const tabIdsToProcess = new Set();
+    for (const [tabId, info] of Array.from(tabContainers.entries())) {
+      if (info.containerName === name) {
+        tabIdsToProcess.add(tabId);
+        tabContainers.delete(tabId);
+        attachedTabs.delete(tabId);
+        attachingTabs.delete(tabId);
+        await clearTabDnrSessionRules(tabId);
+      }
+    }
+
+    const matchingGroupIds = new Set();
+    for (const [gId, cName] of Array.from(groupContainers.entries())) {
+      if (cName === name) {
+        matchingGroupIds.add(gId);
+        groupContainers.delete(gId);
+      }
+    }
+    try {
+      const groups = await chrome.tabGroups.query({ title: name });
+      for (const g of groups || []) {
+        matchingGroupIds.add(g.id);
+        groupContainers.delete(g.id);
+      }
+      if (matchingGroupIds.size > 0) {
+        const allTabs = await chrome.tabs.query({});
+        for (const t of allTabs) {
+          if (matchingGroupIds.has(t.groupId)) {
+            tabIdsToProcess.add(t.id);
+            tabContainers.delete(t.id);
+            attachedTabs.delete(t.id);
+            attachingTabs.delete(t.id);
+            await clearTabDnrSessionRules(t.id);
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    const tabIds = Array.from(tabIdsToProcess);
+    if (tabIds.length > 0) {
+      if (closeTabs) {
+        await chrome.tabs.remove(tabIds).catch(() => {});
+      } else {
+        await chrome.tabs.ungroup(tabIds).catch(() => {});
+      }
+    }
+
+    await persistVaultAndTabs();
+    broadcastPopupState();
+
+    if (notifyHub) {
+      sendToHub({
+        type: 'ext_popup_action',
+        action: 'delete_container',
+        containerName: name
+      });
+      syncLocalVaultToHub({ replace: true });
+      await sendTabsSnapshot();
+    }
+  } finally {
+    removingContainers.delete(name);
+  }
 }
 
 async function updateTabDnrSessionRules(tabId, newRules = []) {
@@ -559,14 +814,98 @@ async function clearTabDnrSessionRules(tabId) {
   await updateTabDnrSessionRules(tabId, []);
 }
 
-async function syncAllTabsForContainer(containerName) {
+const refreshingInitScripts = new Map();
+
+async function refreshTabInitScript(tabId, info, scriptSource = null) {
+  const numericTabId = Number(tabId);
+  if (!attachedTabs.has(numericTabId) || !info) return;
+  if (scriptSource) {
+    info.initScript = scriptSource;
+  }
+  const prev = refreshingInitScripts.get(numericTabId) || Promise.resolve();
+  const next = prev
+    .catch(() => {})
+    .then(async () => {
+      if (!attachedTabs.has(numericTabId)) return;
+      const latestInfo = tabContainers.get(numericTabId) || info;
+      const latestSource =
+        latestInfo.initScript ||
+        (latestInfo.containerName
+          ? buildInitScriptForLocalContainer(latestInfo.containerName)
+          : '');
+      if (!latestSource) return;
+      const target = { tabId: numericTabId };
+      if (latestInfo.initScriptId) {
+        await chrome.debugger
+          .sendCommand(target, 'Page.removeScriptToEvaluateOnNewDocument', {
+            identifier: latestInfo.initScriptId
+          })
+          .catch(() => {});
+        latestInfo.initScriptId = null;
+      }
+      try {
+        const res = await chrome.debugger.sendCommand(
+          target,
+          'Page.addScriptToEvaluateOnNewDocument',
+          {
+            source: latestSource
+          }
+        );
+        if (res?.identifier) {
+          latestInfo.initScriptId = res.identifier;
+        }
+      } catch {
+        // ignore
+      }
+    });
+  refreshingInitScripts.set(numericTabId, next);
+  try {
+    await next;
+  } finally {
+    if (refreshingInitScripts.get(numericTabId) === next) {
+      refreshingInitScripts.delete(numericTabId);
+    }
+  }
+}
+
+async function syncAllTabsForContainer(containerName, excludeTabId = null) {
   const name = normalizeName(containerName);
-  const initScript = buildInitScriptForLocalContainer(name);
+  const entry = ensureContainerInLocalVault(name);
+  const now = Date.now();
+  const jsCookies = entry.cookies
+    .filter(c => !c.httpOnly && (c.expires === null || c.expires > now))
+    .map(c => ({
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      hostOnly: Boolean(c.hostOnly),
+      path: c.path || '/',
+      secure: Boolean(c.secure),
+      sameSite: c.sameSite || 'Lax',
+      expires: c.expires
+    }));
+  const liveSyncExpr = `typeof window.__chrometether_receive_state === 'function' && window.__chrometether_receive_state(${JSON.stringify(
+    {
+      cookies: jsCookies,
+      localStorage: entry.localStorage || {}
+    }
+  )})`;
   for (const [tabId, info] of tabContainers.entries()) {
     if (info.containerName === name) {
+      const initScript = buildInitScriptForLocalContainer(name, info.sessionStorage || null);
       info.initScript = initScript;
       const rules = buildDnrRulesForLocalContainerTab(name, tabId);
       await updateTabDnrSessionRules(tabId, rules);
+      await refreshTabInitScript(tabId, info, initScript);
+      if (attachedTabs.has(Number(tabId)) && Number(tabId) !== Number(excludeTabId)) {
+        chrome.debugger
+          .sendCommand(
+            { tabId: Number(tabId) },
+            'Runtime.evaluate',
+            { expression: liveSyncExpr, silent: true }
+          )
+          .catch(() => {});
+      }
     }
   }
 }
@@ -576,20 +915,32 @@ async function engageFailClosedDnrBlock(tabId) {
   await updateTabDnrSessionRules(tabId, rules);
 }
 
+const attachingTabs = new Map();
+
 async function ensureDebuggerAttached(tabId) {
   const numericTabId = Number(tabId);
   if (attachedTabs.has(numericTabId)) return true;
-  try {
-    await chrome.debugger.attach({ tabId: numericTabId }, '1.3');
-    attachedTabs.add(numericTabId);
-    return true;
-  } catch (err) {
-    if (String(err?.message || '').includes('Already attached')) {
+  if (attachingTabs.has(numericTabId)) {
+    return attachingTabs.get(numericTabId);
+  }
+  const promise = (async () => {
+    try {
+      await chrome.debugger.attach({ tabId: numericTabId }, '1.3');
       attachedTabs.add(numericTabId);
       return true;
+    } catch (err) {
+      const msg = String(err?.message || '').toLowerCase();
+      if (msg.includes('already attached')) {
+        attachedTabs.add(numericTabId);
+        return true;
+      }
+      return false;
+    } finally {
+      attachingTabs.delete(numericTabId);
     }
-    return false;
-  }
+  })();
+  attachingTabs.set(numericTabId, promise);
+  return promise;
 }
 
 async function configureContainerDebuggerOnTab(tabId, containerInfo) {
@@ -616,9 +967,7 @@ async function configureContainerDebuggerOnTab(tabId, containerInfo) {
     await chrome.debugger.sendCommand(target, 'Page.enable', {});
     const scriptSource =
       containerInfo.initScript || buildInitScriptForLocalContainer(containerInfo.containerName);
-    await chrome.debugger.sendCommand(target, 'Page.addScriptToEvaluateOnNewDocument', {
-      source: scriptSource
-    });
+    await refreshTabInitScript(numericTabId, containerInfo, scriptSource);
     await chrome.debugger
       .sendCommand(target, 'Target.setAutoAttach', {
         autoAttach: true,
@@ -632,6 +981,8 @@ async function configureContainerDebuggerOnTab(tabId, containerInfo) {
   }
 }
 
+const groupingLocks = new Map();
+
 async function placeTabInContainerGroup(
   tabId,
   windowId,
@@ -639,26 +990,49 @@ async function placeTabInContainerGroup(
   color = 'blue',
   _badge = ''
 ) {
+  const cleanName = normalizeName(containerName || 'acc-1');
+  const info = tabContainers.get(Number(tabId));
+  if (info) info.groupingInProgress = true;
+  const prevLock = groupingLocks.get(cleanName) || Promise.resolve();
+  const nextLock = prevLock
+    .catch(() => {})
+    .then(async () => {
+      try {
+        // Chrome tabGroups already render a colored pill (blue, orange, green, etc.) — keep title crisp without emoji clutter
+        const title = String(cleanName);
+        const existingGroups = await chrome.tabGroups.query({ windowId, title });
+        if (existingGroups && existingGroups.length > 0) {
+          const gId = existingGroups[0].id;
+          groupContainers.set(gId, cleanName);
+          await chrome.tabs.group({ groupId: gId, tabIds: [tabId] });
+          if (info) info.groupId = gId;
+          return gId;
+        }
+        const groupId = await chrome.tabs.group({
+          createProperties: windowId ? { windowId } : undefined,
+          tabIds: [tabId]
+        });
+        groupContainers.set(groupId, cleanName);
+        if (info) info.groupId = groupId;
+        await chrome.tabGroups.update(groupId, {
+          title,
+          color: color || 'blue',
+          collapsed: false
+        });
+        return groupId;
+      } catch {
+        return null;
+      } finally {
+        if (info) info.groupingInProgress = false;
+      }
+    });
+  groupingLocks.set(cleanName, nextLock);
   try {
-    // Chrome tabGroups already render a colored pill (blue, orange, green, etc.) — keep title crisp without emoji clutter
-    const title = String(containerName || 'acc-1');
-    const existingGroups = await chrome.tabGroups.query({ windowId, title });
-    if (existingGroups && existingGroups.length > 0) {
-      await chrome.tabs.group({ groupId: existingGroups[0].id, tabIds: [tabId] });
-      return existingGroups[0].id;
+    return await nextLock;
+  } finally {
+    if (groupingLocks.get(cleanName) === nextLock) {
+      groupingLocks.delete(cleanName);
     }
-    const groupId = await chrome.tabs.group({
-      createProperties: windowId ? { windowId } : undefined,
-      tabIds: [tabId]
-    });
-    await chrome.tabGroups.update(groupId, {
-      title,
-      color: color || 'blue',
-      collapsed: false
-    });
-    return groupId;
-  } catch {
-    return null;
   }
 }
 
@@ -668,40 +1042,57 @@ async function createContainerTabLocal({
   containerName,
   color = 'blue',
   badge,
-  initScript
+  initScript,
+  fromHub = false
 }) {
-  const created = await chrome.tabs.create({
-    url: 'about:blank',
-    active: !background
-  });
+  creatingTabCount++;
+  let created;
+  try {
+    created = await chrome.tabs.create({
+      url: 'about:blank',
+      active: !background
+    });
+    initializingTabs.add(created.id);
+  } finally {
+    creatingTabCount = Math.max(0, creatingTabCount - 1);
+  }
   const tabId = created.id;
 
-  if (containerName) {
-    const entry = ensureContainerInLocalVault(containerName, color);
-    const info = {
-      containerName: entry.name,
-      color: entry.color,
-      badge: badge || entry.badge,
-      initScript: initScript || buildInitScriptForLocalContainer(entry.name)
-    };
-    tabContainers.set(tabId, info);
-    await persistVaultAndTabs();
+  try {
+    if (containerName) {
+      const entry = ensureContainerInLocalVault(containerName, color);
+      const info = {
+        containerName: entry.name,
+        color: entry.color,
+        badge: badge || entry.badge,
+        groupingInProgress: true,
+        initScript: initScript || buildInitScriptForLocalContainer(entry.name)
+      };
+      tabContainers.set(tabId, info);
+      await persistVaultAndTabs();
 
-    const dnrRules = buildDnrRulesForLocalContainerTab(entry.name, tabId);
-    await updateTabDnrSessionRules(tabId, dnrRules);
-    await placeTabInContainerGroup(
-      tabId,
-      created.windowId,
-      entry.name,
-      info.color,
-      info.badge
-    );
-    await configureContainerDebuggerOnTab(tabId, info);
-    syncLocalVaultToHub();
-  }
+      const dnrRules = buildDnrRulesForLocalContainerTab(entry.name, tabId);
+      await updateTabDnrSessionRules(tabId, dnrRules);
+      await placeTabInContainerGroup(
+        tabId,
+        created.windowId,
+        entry.name,
+        info.color,
+        info.badge
+      );
+      await configureContainerDebuggerOnTab(tabId, info);
+      await persistVaultAndTabs();
+      broadcastPopupState();
+      if (!fromHub) {
+        syncLocalVaultToHub();
+      }
+    }
 
-  if (url && url !== 'about:blank') {
-    await chrome.tabs.update(tabId, { url });
+    if (url && url !== 'about:blank') {
+      await chrome.tabs.update(tabId, { url });
+    }
+  } finally {
+    initializingTabs.delete(tabId);
   }
 
   return {
@@ -719,37 +1110,48 @@ async function convertTabToContainerLocal({
   badge,
   initScript,
   dnrRules,
-  originalUrl
+  originalUrl,
+  fromHub = false
 }) {
   const numericTabId = Number(tabId);
-  const tab = await chrome.tabs.get(numericTabId);
-  const entry = ensureContainerInLocalVault(containerName, color);
-  const info = {
-    containerName: entry.name,
-    color: entry.color,
-    badge: badge || entry.badge,
-    initScript: initScript || buildInitScriptForLocalContainer(entry.name)
-  };
-  tabContainers.set(numericTabId, info);
-  await persistVaultAndTabs();
+  initializingTabs.add(numericTabId);
+  try {
+    const tab = await chrome.tabs.get(numericTabId);
+    const entry = ensureContainerInLocalVault(containerName, color);
+    const info = {
+      containerName: entry.name,
+      color: entry.color,
+      badge: badge || entry.badge,
+      groupingInProgress: true,
+      initScript: initScript || buildInitScriptForLocalContainer(entry.name)
+    };
+    tabContainers.set(numericTabId, info);
+    await persistVaultAndTabs();
 
-  await chrome.tabs.update(numericTabId, { url: 'about:blank' });
-  const rulesToApply = Array.isArray(dnrRules)
-    ? dnrRules
-    : buildDnrRulesForLocalContainerTab(entry.name, numericTabId);
-  await updateTabDnrSessionRules(numericTabId, rulesToApply);
-  await placeTabInContainerGroup(
-    numericTabId,
-    tab.windowId,
-    entry.name,
-    info.color,
-    info.badge
-  );
-  await configureContainerDebuggerOnTab(numericTabId, info);
-  if (originalUrl && originalUrl !== 'about:blank') {
-    await chrome.tabs.update(numericTabId, { url: originalUrl });
+    await chrome.tabs.update(numericTabId, { url: 'about:blank' });
+    const rulesToApply = Array.isArray(dnrRules)
+      ? dnrRules
+      : buildDnrRulesForLocalContainerTab(entry.name, numericTabId);
+    await updateTabDnrSessionRules(numericTabId, rulesToApply);
+    await placeTabInContainerGroup(
+      numericTabId,
+      tab.windowId,
+      entry.name,
+      info.color,
+      info.badge
+    );
+    await configureContainerDebuggerOnTab(numericTabId, info);
+    if (originalUrl && originalUrl !== 'about:blank') {
+      await chrome.tabs.update(numericTabId, { url: originalUrl });
+    }
+    await persistVaultAndTabs();
+    broadcastPopupState();
+    if (!fromHub) {
+      syncLocalVaultToHub();
+    }
+  } finally {
+    initializingTabs.delete(numericTabId);
   }
-  syncLocalVaultToHub();
   return { ok: true, tabId: numericTabId };
 }
 
@@ -775,45 +1177,104 @@ async function handleHubRequest(msg) {
     let result = {};
 
     if (action === 'create_tab') {
-      result = await createContainerTabLocal(params);
+      result = await createContainerTabLocal({ ...params, fromHub: true });
     } else if (action === 'convert_tab_to_container') {
-      result = await convertTabToContainerLocal(params);
+      result = await convertTabToContainerLocal({ ...params, fromHub: true });
     } else if (action === 'assign_tab_container') {
       const { tabId, containerName, color, badge, initScript, dnrRules } = params;
       const numericTabId = Number(tabId);
-      const tab = await chrome.tabs.get(numericTabId);
-      const entry = ensureContainerInLocalVault(containerName, color);
-      const info = {
-        containerName: entry.name,
-        color: entry.color,
-        badge: badge || entry.badge,
-        initScript: initScript || buildInitScriptForLocalContainer(entry.name)
-      };
-      tabContainers.set(numericTabId, info);
-      await persistVaultAndTabs();
-      const rules = Array.isArray(dnrRules)
-        ? dnrRules
-        : buildDnrRulesForLocalContainerTab(entry.name, numericTabId);
-      await updateTabDnrSessionRules(numericTabId, rules);
-      await placeTabInContainerGroup(
-        numericTabId,
-        tab.windowId,
-        entry.name,
-        info.color,
-        info.badge
-      );
-      await configureContainerDebuggerOnTab(numericTabId, info);
+      initializingTabs.add(numericTabId);
+      try {
+        const tab = await chrome.tabs.get(numericTabId);
+        const entry = ensureContainerInLocalVault(containerName, color);
+        const info = {
+          containerName: entry.name,
+          color: entry.color,
+          badge: badge || entry.badge,
+          groupingInProgress: true,
+          initScript: initScript || buildInitScriptForLocalContainer(entry.name)
+        };
+        tabContainers.set(numericTabId, info);
+        await persistVaultAndTabs();
+        const rules = Array.isArray(dnrRules)
+          ? dnrRules
+          : buildDnrRulesForLocalContainerTab(entry.name, numericTabId);
+        await updateTabDnrSessionRules(numericTabId, rules);
+        await placeTabInContainerGroup(
+          numericTabId,
+          tab.windowId,
+          entry.name,
+          info.color,
+          info.badge
+        );
+        await configureContainerDebuggerOnTab(numericTabId, info);
+        await persistVaultAndTabs();
+        broadcastPopupState();
+      } finally {
+        initializingTabs.delete(numericTabId);
+      }
       result = { ok: true };
+    } else if (action === 'ensure_container') {
+      ensureContainerInLocalVault(params.containerName || 'acc-1', params.color || 'blue');
+      await persistVaultAndTabs();
+      broadcastPopupState();
+      result = { ok: true };
+    } else if (action === 'clear_container') {
+      const name = normalizeName(params.containerName);
+      const entry = localVault.get(name);
+      if (entry) {
+        entry.cookies = [];
+        entry.localStorage = {};
+        entry.sessionStorage = {};
+        await persistVaultAndTabs();
+        await syncAllTabsForContainer(entry.name);
+        broadcastPopupState();
+      }
+      result = { ok: true };
+    } else if (action === 'delete_container') {
+      await deleteContainerLocal(params.containerName, {
+        notifyHub: false,
+        closeTabs: params.closeTabs !== false
+      });
+      result = { ok: true };
+    } else if (action === 'reload_extension') {
+      sendToHub({ type: 'hub_response', reqId, result: { ok: true } });
+      setTimeout(() => chrome.runtime.reload(), 50);
+      return;
     } else if (action === 'update_tab_dnr_rules') {
-      const { tabId, rules } = params;
-      await updateTabDnrSessionRules(Number(tabId), Array.isArray(rules) ? rules : []);
+      const { tabId, rules, initScript } = params;
+      const numericTabId = Number(tabId);
+      await updateTabDnrSessionRules(numericTabId, Array.isArray(rules) ? rules : []);
+      if (initScript && tabContainers.has(numericTabId)) {
+        const info = tabContainers.get(numericTabId);
+        await refreshTabInitScript(numericTabId, info, initScript);
+      }
       result = { ok: true };
     } else if (action === 'close_tab') {
       const numericTabId = Number(params.tabId);
+      const info = tabContainers.get(numericTabId);
       await clearTabDnrSessionRules(numericTabId);
       tabContainers.delete(numericTabId);
-      await persistVaultAndTabs();
-      await chrome.tabs.remove(numericTabId);
+      attachedTabs.delete(numericTabId);
+      attachingTabs.delete(numericTabId);
+      await chrome.tabs.remove(numericTabId).catch(() => {});
+      if (info?.containerName) {
+        const hasRemaining = Array.from(tabContainers.values()).some(
+          v => v.containerName === info.containerName
+        );
+        if (!hasRemaining) {
+          await deleteContainerLocal(info.containerName, {
+            notifyHub: true,
+            closeTabs: false
+          });
+        } else {
+          await persistVaultAndTabs();
+          broadcastPopupState();
+        }
+      } else {
+        await persistVaultAndTabs();
+        broadcastPopupState();
+      }
       result = { ok: true };
     } else if (action === 'activate_tab') {
       const numericTabId = Number(params.tabId);
@@ -824,7 +1285,16 @@ async function handleHubRequest(msg) {
       result = { ok: true };
     } else if (action === 'cdp_command') {
       const numericTabId = Number(params.tabId);
-      await ensureDebuggerAttached(numericTabId);
+      const ok = await ensureDebuggerAttached(numericTabId);
+      if (!ok) {
+        throw new Error(`Failed to attach debugger to tab ${numericTabId}`);
+      }
+      if (
+        (params.method === 'Page.reload' || params.method === 'Page.navigate') &&
+        refreshingInitScripts.has(numericTabId)
+      ) {
+        await refreshingInitScripts.get(numericTabId).catch(() => {});
+      }
       result =
         (await chrome.debugger.sendCommand(
           { tabId: numericTabId },
@@ -863,6 +1333,7 @@ chrome.webRequest.onHeadersReceived.addListener(
       if (changed) {
         persistVaultAndTabs();
         syncAllTabsForContainer(containerInfo.containerName);
+        broadcastPopupState();
       }
       sendToHub({
         type: 'ext_set_cookie_captured',
@@ -878,25 +1349,109 @@ chrome.webRequest.onHeadersReceived.addListener(
 );
 
 chrome.tabs.onCreated.addListener(async tab => {
-  if (tab.openerTabId && tabContainers.has(tab.openerTabId) && !tabContainers.has(tab.id)) {
+  if (creatingTabCount > 0 || initializingTabs.has(tab.id) || tabContainers.has(tab.id)) return;
+  let targetContainerName = null;
+  let targetColor = 'blue';
+  let targetBadge = '🔵';
+
+  if (tab.openerTabId && tabContainers.has(tab.openerTabId)) {
     const parentInfo = tabContainers.get(tab.openerTabId);
-    tabContainers.set(tab.id, { ...parentInfo });
+    targetContainerName = parentInfo.containerName;
+    targetColor = parentInfo.color;
+    targetBadge = parentInfo.badge;
+  } else if (tab.groupId > 0 && groupContainers.has(tab.groupId)) {
+    targetContainerName = groupContainers.get(tab.groupId);
+    const entry = localVault.get(targetContainerName);
+    if (entry) {
+      targetColor = entry.color;
+      targetBadge = entry.badge;
+    }
+  }
+
+  if (targetContainerName) {
+    const entry = ensureContainerInLocalVault(targetContainerName, targetColor);
+    const info = {
+      containerName: entry.name,
+      color: entry.color,
+      badge: targetBadge || entry.badge,
+      groupId: tab.groupId > 0 ? tab.groupId : undefined,
+      groupingInProgress: true,
+      initScript: buildInitScriptForLocalContainer(entry.name)
+    };
+    tabContainers.set(tab.id, info);
     await persistVaultAndTabs();
-    const rules = buildDnrRulesForLocalContainerTab(parentInfo.containerName, tab.id);
+    const rules = buildDnrRulesForLocalContainerTab(entry.name, tab.id);
     await updateTabDnrSessionRules(tab.id, rules);
     await placeTabInContainerGroup(
       tab.id,
       tab.windowId,
-      parentInfo.containerName,
-      parentInfo.color,
-      parentInfo.badge
+      entry.name,
+      info.color,
+      info.badge
     );
-    await configureContainerDebuggerOnTab(tab.id, parentInfo);
+    await configureContainerDebuggerOnTab(tab.id, info);
+    await persistVaultAndTabs();
+    broadcastPopupState();
   }
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.url || changeInfo.title || changeInfo.status === 'complete') {
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.groupId !== undefined) {
+    if (changeInfo.groupId === -1 && tabContainers.has(tabId)) {
+      const info = tabContainers.get(tabId);
+      if (info && !info.groupingInProgress && !removingContainers.has(info.containerName)) {
+        const oldContainerName = info.containerName;
+        tabContainers.delete(tabId);
+        await clearTabDnrSessionRules(tabId);
+        const hasRemaining = Array.from(tabContainers.values()).some(
+          v => v.containerName === oldContainerName
+        );
+        if (!hasRemaining) {
+          await deleteContainerLocal(oldContainerName, {
+            notifyHub: true,
+            closeTabs: false
+          });
+        } else {
+          await persistVaultAndTabs();
+          broadcastPopupState();
+        }
+      }
+    } else if (changeInfo.groupId > 0) {
+      if (tabContainers.has(tabId)) {
+        const info = tabContainers.get(tabId);
+        info.groupId = changeInfo.groupId;
+        groupContainers.set(changeInfo.groupId, info.containerName);
+      } else if (groupContainers.has(changeInfo.groupId)) {
+        const cName = groupContainers.get(changeInfo.groupId);
+        if (cName && !removingContainers.has(cName)) {
+          const entry = ensureContainerInLocalVault(cName);
+          const info = {
+            containerName: entry.name,
+            color: entry.color,
+            badge: entry.badge,
+            groupId: changeInfo.groupId,
+            initScript: buildInitScriptForLocalContainer(entry.name)
+          };
+          tabContainers.set(tabId, info);
+          const rules = buildDnrRulesForLocalContainerTab(entry.name, tabId);
+          await updateTabDnrSessionRules(tabId, rules);
+          await configureContainerDebuggerOnTab(tabId, info);
+          await persistVaultAndTabs();
+          broadcastPopupState();
+        }
+      }
+    }
+  }
+
+  if (creatingTabCount > 0 && !tabContainers.has(tabId)) return;
+  if (initializingTabs.has(tabId)) return;
+
+  if (
+    changeInfo.url ||
+    changeInfo.title ||
+    changeInfo.status === 'complete' ||
+    changeInfo.groupId !== undefined
+  ) {
     sendToHub({
       type: 'ext_tab_updated',
       tab: {
@@ -911,14 +1466,107 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener(async tabId => {
+  initializingTabs.delete(tabId);
   attachedTabs.delete(tabId);
-  if (tabContainers.has(tabId)) {
+  attachingTabs.delete(tabId);
+  const info = tabContainers.get(tabId);
+  if (info) {
+    const cName = info.containerName;
     tabContainers.delete(tabId);
-    await persistVaultAndTabs();
     await clearTabDnrSessionRules(tabId);
+    sendToHub({ type: 'ext_tab_removed', tabId });
+
+    if (cName && !removingContainers.has(cName)) {
+      const hasRemaining = Array.from(tabContainers.values()).some(
+        v => v.containerName === cName
+      );
+      if (!hasRemaining) {
+        await deleteContainerLocal(cName, { notifyHub: true, closeTabs: false });
+        return;
+      }
+    }
+    await persistVaultAndTabs();
+    broadcastPopupState();
+    return;
   }
   sendToHub({ type: 'ext_tab_removed', tabId });
 });
+
+if (chrome.tabGroups?.onRemoved) {
+  chrome.tabGroups.onRemoved.addListener(async group => {
+    const cName =
+      groupContainers.get(group.id) ||
+      (group.title && localVault.has(normalizeName(group.title))
+        ? normalizeName(group.title)
+        : null);
+    groupContainers.delete(group.id);
+    if (!cName || removingContainers.has(cName)) return;
+
+    // Wait briefly so any accompanying chrome.tabs.onRemoved events settle
+    await new Promise(r => setTimeout(r, 150));
+    if (removingContainers.has(cName)) return;
+
+    try {
+      const allTabs = await chrome.tabs.query({});
+      const liveTabMap = new Map(allTabs.map(t => [t.id, t]));
+      for (const [tId, info] of Array.from(tabContainers.entries())) {
+        if (info.containerName === cName) {
+          const live = liveTabMap.get(tId);
+          if (!live || live.groupId === -1 || live.groupId === group.id) {
+            tabContainers.delete(tId);
+            await clearTabDnrSessionRules(tId);
+            if (live) {
+              sendToHub({
+                type: 'ext_tab_updated',
+                tab: {
+                  tabId: tId,
+                  windowId: live.windowId,
+                  url: live.url || 'about:blank',
+                  title: live.title || '',
+                  containerName: null
+                }
+              });
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    const hasRemaining = Array.from(tabContainers.values()).some(
+      v => v.containerName === cName
+    );
+    if (!hasRemaining) {
+      await deleteContainerLocal(cName, { notifyHub: true, closeTabs: false });
+    } else {
+      await persistVaultAndTabs();
+      broadcastPopupState();
+    }
+  });
+}
+
+if (chrome.tabGroups?.onUpdated) {
+  chrome.tabGroups.onUpdated.addListener(async group => {
+    const trackedName = groupContainers.get(group.id);
+    if (!trackedName) return;
+    const entry = localVault.get(trackedName);
+    if (!entry) return;
+    if (group.color && COLOR_BADGES[group.color] && entry.color !== group.color) {
+      entry.color = group.color;
+      entry.badge = COLOR_BADGES[group.color];
+      for (const info of tabContainers.values()) {
+        if (info.containerName === trackedName) {
+          info.color = group.color;
+          info.badge = entry.badge;
+        }
+      }
+      await persistVaultAndTabs();
+      syncLocalVaultToHub();
+      broadcastPopupState();
+    }
+  });
+}
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!source.tabId) return;
@@ -934,19 +1582,37 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         const entry = ensureContainerInLocalVault(cName);
         if (data.type === 'setCookie' && data.cookie) {
           applySetCookiesToLocalVault(cName, [data.cookie], data.url);
-          syncAllTabsForContainer(cName);
+          syncAllTabsForContainer(cName, source.tabId);
         } else if (data.type === 'storageSet' && data.origin) {
+          const tabInfo = tabContainers.get(source.tabId);
+          if (data.session && tabInfo) {
+            if (!tabInfo.sessionStorage) tabInfo.sessionStorage = {};
+            if (!tabInfo.sessionStorage[data.origin]) tabInfo.sessionStorage[data.origin] = {};
+            tabInfo.sessionStorage[data.origin][String(data.key)] = String(data.value);
+          }
           const store = data.session ? entry.sessionStorage : entry.localStorage;
           if (!store[data.origin]) store[data.origin] = {};
           store[data.origin][String(data.key)] = String(data.value);
+          syncAllTabsForContainer(cName, source.tabId);
         } else if (data.type === 'storageRemove' && data.origin) {
+          const tabInfo = tabContainers.get(source.tabId);
+          if (data.session && tabInfo?.sessionStorage?.[data.origin]) {
+            delete tabInfo.sessionStorage[data.origin][String(data.key)];
+          }
           const store = data.session ? entry.sessionStorage : entry.localStorage;
           if (store[data.origin]) delete store[data.origin][String(data.key)];
+          syncAllTabsForContainer(cName, source.tabId);
         } else if (data.type === 'storageClear' && data.origin) {
+          const tabInfo = tabContainers.get(source.tabId);
+          if (data.session && tabInfo?.sessionStorage) {
+            delete tabInfo.sessionStorage[data.origin];
+          }
           const store = data.session ? entry.sessionStorage : entry.localStorage;
           delete store[data.origin];
+          syncAllTabsForContainer(cName, source.tabId);
         }
         persistVaultAndTabs();
+        broadcastPopupState();
       }
     } catch {
       // ignore
@@ -965,17 +1631,22 @@ chrome.debugger.onDetach.addListener(async (source, reason) => {
   if (!source.tabId) return;
   const tabId = source.tabId;
   attachedTabs.delete(tabId);
+  attachingTabs.delete(tabId);
+  if (tabContainers.has(tabId)) {
+    tabContainers.get(tabId).initScriptId = null;
+  }
 
+  let reattached = false;
   if (tabContainers.has(tabId)) {
     const info = tabContainers.get(tabId);
     if (reason !== 'target_closed') {
-      const reattached = await configureContainerDebuggerOnTab(tabId, info);
+      reattached = await configureContainerDebuggerOnTab(tabId, info);
       if (!reattached) {
         await engageFailClosedDnrBlock(tabId);
-        sendToHub({ type: 'ext_debugger_detached', tabId, reason });
       }
     }
   }
+  sendToHub({ type: 'ext_debugger_detached', tabId, reason, reattached });
 });
 
 async function connectHub() {
@@ -1019,8 +1690,9 @@ async function connectHub() {
     }, KEEPALIVE_INTERVAL_MS);
 
     await restoreSessionState();
-    syncLocalVaultToHub();
+    syncLocalVaultToHub({ replace: true });
     await sendTabsSnapshot();
+    broadcastPopupState();
   };
 
   ws.onmessage = event => {
@@ -1030,11 +1702,15 @@ async function connectHub() {
         if (msg.token) hubToken = msg.token;
         if (Array.isArray(msg.containers)) {
           for (const c of msg.containers) {
-            if (c?.name) ensureContainerInLocalVault(c.name, c.color);
+            if (!c?.name) continue;
+            const clean = normalizeName(c.name);
+            if (deletedContainerNames.has(clean)) continue;
+            ensureContainerInLocalVault(clean, c.color);
           }
           persistVaultAndTabs();
         }
-        syncLocalVaultToHub();
+        syncLocalVaultToHub({ replace: true });
+        broadcastPopupState();
         return;
       }
       if (msg.type === 'ping') {
@@ -1056,6 +1732,7 @@ async function connectHub() {
       clearInterval(keepAliveTimer);
       keepAliveTimer = null;
     }
+    broadcastPopupState();
     scheduleReconnect(4000);
   };
 
@@ -1082,10 +1759,13 @@ function scheduleReconnect(delayMs = 4000) {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'popup_get_state') {
     connectHub();
-    sendResponse({
-      connected: Boolean(ws && ws.readyState === WebSocket.OPEN),
-      containers: getContainerSummaries(),
-      activeContainerTabsCount: tabContainers.size
+    reconcileTabsAndGroupsWithChrome().then(() => {
+      sendResponse({
+        bgVersion: '2.2.0',
+        connected: Boolean(ws && ws.readyState === WebSocket.OPEN),
+        containers: getContainerSummaries(),
+        activeContainerTabsCount: tabContainers.size
+      });
     });
     return true;
   }
@@ -1097,6 +1777,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         ensureContainerInLocalVault(payload.containerName || 'acc-1', payload.color || 'blue');
         await persistVaultAndTabs();
         syncLocalVaultToHub();
+        broadcastPopupState();
       } else if (payload.action === 'open_container_tab') {
         await createContainerTabLocal({
           containerName: payload.containerName || 'acc-1',
@@ -1121,16 +1802,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           await syncAllTabsForContainer(entry.name);
         }
         sendToHub({ type: 'ext_popup_action', ...payload });
+        broadcastPopupState();
       } else if (payload.action === 'delete_container' && payload.containerName) {
-        const name = normalizeName(payload.containerName);
-        localVault.delete(name);
-        for (const [tabId, info] of tabContainers.entries()) {
-          if (info.containerName === name) {
-            tabContainers.delete(tabId);
-            await clearTabDnrSessionRules(tabId);
-          }
-        }
-        await persistVaultAndTabs();
+        await deleteContainerLocal(payload.containerName, {
+          notifyHub: true,
+          closeTabs: true
+        });
       }
       sendResponse({
         ok: true,

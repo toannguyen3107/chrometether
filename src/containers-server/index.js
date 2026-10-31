@@ -78,6 +78,25 @@ export const CONTAINER_TOOL_DEFINITIONS = [
       },
       required: ['name']
     }
+  },
+  {
+    name: 'delete_container',
+    description:
+      'Delete a named container from the vault, close its Chrome Tab Group / container tabs, and sync deletion between the Extension and CDP Hub.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Container name to delete'
+        },
+        closeTabs: {
+          type: 'boolean',
+          description: 'Whether to close active tabs belonging to this container (default: true)'
+        }
+      },
+      required: ['name']
+    }
   }
 ];
 
@@ -141,11 +160,17 @@ export async function handleContainerToolCall(name, args = {}) {
     case 'clear_container': {
       const containerName = args.name || args.container;
       if (!containerName) throw new Error('Container name is required');
+      if (args.deleteContainer) {
+        return handleContainerToolCall('delete_container', {
+          name: containerName,
+          closeTabs: args.closeTabs !== false
+        });
+      }
       try {
         await ensureHubDaemon({ waitTimeoutMs: 2000 });
         const res = await hubHttpRequest('/containers/clear', {
           method: 'POST',
-          body: { name: containerName }
+          body: { name: containerName, deleteContainer: Boolean(args.deleteContainer) }
         });
         if (res.statusCode === 200 && res.data?.ok) {
           return res.data;
@@ -156,6 +181,29 @@ export async function handleContainerToolCall(name, args = {}) {
       const vault = new ContainerVault();
       const cleared = vault.clearContainer(containerName);
       return { ok: true, cleared };
+    }
+
+    case 'delete_container': {
+      const containerName = args.name || args.container;
+      if (!containerName) throw new Error('Container name is required');
+      try {
+        await ensureHubDaemon({ waitTimeoutMs: 2000 });
+        const res = await hubHttpRequest('/containers/delete', {
+          method: 'POST',
+          body: {
+            name: containerName,
+            closeTabs: args.closeTabs !== false
+          }
+        });
+        if (res.statusCode === 200 && res.data?.ok) {
+          return res.data;
+        }
+      } catch {
+        // Fallback to direct vault delete
+      }
+      const vault = new ContainerVault();
+      const deleted = vault.deleteContainer(containerName);
+      return { ok: true, deleted };
     }
 
     default:
