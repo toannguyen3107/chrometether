@@ -637,10 +637,11 @@ async function placeTabInContainerGroup(
   windowId,
   containerName,
   color = 'blue',
-  badge = '🔵'
+  _badge = ''
 ) {
   try {
-    const title = `${badge} ${containerName}`;
+    // Chrome tabGroups already render a colored pill (blue, orange, green, etc.) — keep title crisp without emoji clutter
+    const title = String(containerName || 'acc-1');
     const existingGroups = await chrome.tabGroups.query({ windowId, title });
     if (existingGroups && existingGroups.length > 0) {
       await chrome.tabs.group({ groupId: existingGroups[0].id, tabIds: [tabId] });

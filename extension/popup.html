@@ -2,135 +2,564 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>ChromeTether Containers</title>
+    <title>ChromeTether</title>
     <style>
-      body {
-        font-family: system-ui, -apple-system, sans-serif;
-        width: 340px;
-        margin: 0;
-        padding: 12px;
-        background: #0f172a;
-        color: #f8fafc;
+      :root {
+        --bg-base: #111110;
+        --bg-surface: #181816;
+        --bg-elevated: #1f1f1c;
+        --bg-well: #0b0b0a;
+        --border-subtle: #262623;
+        --border-strong: #383833;
+        --text-primary: #ededec;
+        --text-secondary: #9b9a94;
+        --text-muted: #686762;
+        --accent-ivory: #ededec;
+        --accent-amber: #e07a47;
+        --accent-green: #4daa7f;
+        --danger-fg: #e56b6b;
+        --danger-bg: rgba(229, 107, 107, 0.12);
+
+        --swatch-blue: #4c8eda;
+        --swatch-orange: #e07a47;
+        --swatch-green: #4daa7f;
+        --swatch-purple: #9b72cf;
+        --swatch-pink: #d96b98;
+        --swatch-cyan: #45a5b5;
+
+        --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', system-ui, sans-serif;
+        --font-mono: 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Consolas, monospace;
       }
-      .header {
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        width: 368px;
+        background: var(--bg-base);
+        color: var(--text-primary);
+        font-family: var(--font-sans);
+        font-size: 12.5px;
+        line-height: 1.4;
+        -webkit-font-smoothing: antialiased;
+        user-select: none;
+      }
+
+      /* Top Header */
+      .topbar {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        margin-bottom: 10px;
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--border-subtle);
+        background: var(--bg-surface);
       }
-      .title {
-        font-weight: 700;
-        font-size: 14px;
-      }
-      .status {
-        font-size: 11px;
-        padding: 2px 8px;
-        border-radius: 999px;
-        background: #065f46;
-        color: #6ee7b7;
-      }
-      .row {
+
+      .brand {
         display: flex;
+        align-items: center;
+        gap: 9px;
+      }
+
+      .brand-mark {
+        width: 20px;
+        height: 20px;
+        flex-shrink: 0;
+      }
+
+      .brand-name {
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        color: var(--text-primary);
+      }
+
+      .brand-tag {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        color: var(--text-muted);
+        padding: 1px 5px;
+        border: 1px solid var(--border-subtle);
+        border-radius: 3px;
+        background: var(--bg-base);
+      }
+
+      .bridge-pill {
+        display: inline-flex;
+        align-items: center;
         gap: 6px;
-        margin-bottom: 8px;
+        font-family: var(--font-mono);
+        font-size: 10px;
+        font-weight: 500;
+        letter-spacing: 0.02em;
+        color: var(--text-secondary);
+        background: var(--bg-base);
+        border: 1px solid var(--border-subtle);
+        padding: 3px 7px;
+        border-radius: 4px;
       }
-      input,
-      select,
-      button {
-        font-size: 12px;
-        border-radius: 6px;
-        border: 1px solid #334155;
-        background: #1e293b;
-        color: #f8fafc;
-        padding: 6px 8px;
+
+      .bridge-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--text-muted);
       }
-      input {
+
+      .bridge-pill.linked {
+        color: var(--text-primary);
+        border-color: rgba(77, 170, 127, 0.35);
+      }
+
+      .bridge-pill.linked .bridge-dot {
+        background: var(--accent-green);
+        box-shadow: 0 0 6px rgba(77, 170, 127, 0.6);
+      }
+
+      /* Active Tab Bar */
+      .context-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 14px;
+        background: var(--bg-base);
+        border-bottom: 1px solid var(--border-subtle);
+      }
+
+      .context-info {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        min-width: 0;
         flex: 1;
       }
-      button {
-        cursor: pointer;
-        font-weight: 600;
-        background: #2563eb;
-        border-color: #3b82f6;
+
+      .context-icon {
+        width: 13px;
+        height: 13px;
+        color: var(--text-muted);
+        flex-shrink: 0;
       }
-      button:hover {
-        filter: brightness(1.1);
-      }
-      button.secondary {
-        background: #334155;
-        border-color: #475569;
-      }
-      button.danger {
-        background: #7f1d1d;
-        border-color: #991b1b;
-        padding: 4px 7px;
-      }
-      .note {
+
+      .context-host {
+        font-family: var(--font-mono);
         font-size: 11px;
-        color: #94a3b8;
-        margin-top: 8px;
-        line-height: 1.35;
+        color: var(--text-secondary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
-      .list {
-        margin-top: 10px;
-        border-top: 1px solid #1e293b;
-        padding-top: 8px;
+
+      /* Composer Section */
+      .composer {
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--border-subtle);
+        background: var(--bg-surface);
+      }
+
+      .composer-top {
         display: flex;
-        flex-direction: column;
-        gap: 6px;
-        max-height: 240px;
-        overflow-y: auto;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 9px;
       }
-      .item {
+
+      .input-well {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        flex: 1;
+        height: 30px;
+        padding: 0 9px;
+        background: var(--bg-well);
+        border: 1px solid var(--border-subtle);
+        border-radius: 5px;
+        transition: border-color 120ms ease;
+      }
+
+      .input-well:focus-within {
+        border-color: var(--border-strong);
+      }
+
+      .active-swatch-indicator {
+        width: 8px;
+        height: 8px;
+        border-radius: 2px;
+        background: var(--swatch-blue);
+        flex-shrink: 0;
+      }
+
+      .input-well input {
+        width: 100%;
+        border: none;
+        outline: none;
+        background: transparent;
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 12px;
+      }
+
+      .input-well input::placeholder {
+        color: var(--text-muted);
+      }
+
+      .swatch-group {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        padding: 4px 6px;
+        background: var(--bg-well);
+        border: 1px solid var(--border-subtle);
+        border-radius: 5px;
+        height: 30px;
+      }
+
+      .swatch-btn {
+        width: 14px;
+        height: 14px;
+        border-radius: 3px;
+        border: none;
+        cursor: pointer;
+        opacity: 0.55;
+        transition: opacity 100ms ease, transform 100ms ease, box-shadow 100ms ease;
+      }
+
+      .swatch-btn:hover {
+        opacity: 0.9;
+      }
+
+      .swatch-btn.active {
+        opacity: 1;
+        box-shadow: 0 0 0 1.5px var(--bg-well), 0 0 0 3px var(--text-primary);
+      }
+
+      .composer-actions {
+        display: grid;
+        grid-template-columns: 1fr 1.25fr;
+        gap: 7px;
+      }
+
+      /* Tactile Keycap Buttons */
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        height: 29px;
+        padding: 0 10px;
+        font-family: var(--font-sans);
+        font-size: 11.5px;
+        font-weight: 500;
+        border-radius: 5px;
+        border: 1px solid var(--border-subtle);
+        background: var(--bg-elevated);
+        color: var(--text-primary);
+        cursor: pointer;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+        transition: background 100ms ease, border-color 100ms ease, color 100ms ease;
+        white-space: nowrap;
+      }
+
+      .btn:hover {
+        background: #282824;
+        border-color: var(--border-strong);
+      }
+
+      .btn:active {
+        transform: translateY(0.5px);
+      }
+
+      .btn-primary {
+        background: var(--accent-ivory);
+        color: var(--bg-base);
+        border-color: var(--accent-ivory);
+        font-weight: 600;
+      }
+
+      .btn-primary:hover {
+        background: #dcdcd9;
+        border-color: #dcdcd9;
+      }
+
+      .btn-compact {
+        height: 23px;
+        padding: 0 8px;
+        font-size: 11px;
+        color: var(--text-secondary);
+      }
+
+      .btn-compact:hover {
+        color: var(--text-primary);
+      }
+
+      .kbd-hint {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        opacity: 0.65;
+      }
+
+      /* Containers List Section */
+      .section-header {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        background: #1e293b;
-        padding: 6px 8px;
-        border-radius: 6px;
-        font-size: 12px;
+        padding: 10px 14px 6px;
       }
-      .meta {
+
+      .section-title {
+        font-family: var(--font-mono);
         font-size: 10px;
-        color: #94a3b8;
-        display: block;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--text-muted);
+      }
+
+      .section-count {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        color: var(--text-muted);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .containers-list {
+        padding: 0 14px 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+        max-height: 236px;
+        overflow-y: auto;
+      }
+
+      .containers-list::-webkit-scrollbar {
+        width: 5px;
+      }
+
+      .containers-list::-webkit-scrollbar-thumb {
+        background: var(--border-subtle);
+        border-radius: 3px;
+      }
+
+      .container-card {
+        position: relative;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 7px 8px 7px 12px;
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        border-radius: 5px;
+        transition: border-color 100ms ease, background 100ms ease;
+      }
+
+      .container-card:hover {
+        background: var(--bg-elevated);
+        border-color: var(--border-strong);
+      }
+
+      .container-bar {
+        position: absolute;
+        left: 0;
+        top: 5px;
+        bottom: 5px;
+        width: 3px;
+        border-radius: 0 2px 2px 0;
+        background: var(--swatch-blue);
+      }
+
+      .container-main {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+        flex: 1;
+        cursor: pointer;
+      }
+
+      .container-title-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .container-name {
+        font-family: var(--font-mono);
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-primary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .container-ctx {
+        font-family: var(--font-mono);
+        font-size: 9.5px;
+        color: var(--text-muted);
+        padding: 0 4px;
+        border: 1px solid var(--border-subtle);
+        border-radius: 3px;
+        background: var(--bg-base);
+      }
+
+      .container-meta {
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        color: var(--text-secondary);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .container-actions {
+        display: flex;
+        align-items: center;
+        gap: 3px;
+      }
+
+      .icon-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 25px;
+        height: 25px;
+        border-radius: 4px;
+        border: 1px solid transparent;
+        background: transparent;
+        color: var(--text-secondary);
+        cursor: pointer;
+        transition: background 100ms ease, color 100ms ease, border-color 100ms ease;
+      }
+
+      .icon-btn:hover {
+        background: var(--bg-base);
+        border-color: var(--border-subtle);
+        color: var(--text-primary);
+      }
+
+      .icon-btn.danger:hover {
+        background: var(--danger-bg);
+        border-color: rgba(229, 107, 107, 0.3);
+        color: var(--danger-fg);
+      }
+
+      .icon-btn svg {
+        width: 13px;
+        height: 13px;
+      }
+
+      .empty-state {
+        padding: 20px 12px;
+        text-align: center;
+        border: 1px dashed var(--border-subtle);
+        border-radius: 5px;
+        color: var(--text-muted);
+        font-size: 11.5px;
+      }
+
+      /* Footer */
+      .footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 14px;
+        border-top: 1px solid var(--border-subtle);
+        background: var(--bg-base);
+        font-family: var(--font-mono);
+        font-size: 10px;
+        color: var(--text-muted);
       }
     </style>
   </head>
   <body>
-    <div class="header">
-      <span class="title">ChromeTether Containers</span>
-      <span id="hub-status" class="status">Ready</span>
-    </div>
+    <!-- Header -->
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="6" y="6" width="116" height="116" rx="26" fill="#141413" stroke="#363632" stroke-width="6" />
+          <rect x="46" y="24" width="56" height="46" rx="10" fill="#E07A47" />
+          <rect x="36" y="41" width="56" height="46" rx="10" fill="#4C8EDA" stroke="#141413" stroke-width="5" />
+          <rect x="26" y="58" width="56" height="46" rx="10" fill="#EDEDEC" stroke="#141413" stroke-width="5" />
+          <rect x="35" y="68" width="22" height="7" rx="3.5" fill="#141413" />
+          <circle cx="70" cy="71.5" r="4.5" fill="#E07A47" />
+        </svg>
+        <span class="brand-name">ChromeTether</span>
+        <span class="brand-tag">MV3</span>
+      </div>
+      <div id="hub-status" class="bridge-pill" title="Local Vault &amp; MCP Bridge Status">
+        <span class="bridge-dot"></span>
+        <span id="hub-status-text">LOCAL</span>
+      </div>
+    </header>
 
-    <div class="row">
-      <input id="container-name" type="text" placeholder="Name (e.g. acc-1, acc-2)" value="acc-1" />
-      <select id="container-color">
-        <option value="blue">🔵 Blue</option>
-        <option value="orange">🟠 Orange</option>
-        <option value="green">🟢 Green</option>
-        <option value="purple">🟣 Purple</option>
-        <option value="pink">🩷 Pink</option>
-        <option value="cyan">🩵 Cyan</option>
-      </select>
-    </div>
-
-    <div class="row">
-      <button id="btn-create" class="secondary" style="flex: 1">+ Save Container</button>
-      <button id="btn-open" style="flex: 1">+ New Container Tab</button>
-    </div>
-
-    <div class="row">
-      <button id="btn-convert" class="secondary" style="width: 100%">
-        Move Current Tab into Selected Container
+    <!-- Active Tab Contextual Bar -->
+    <div class="context-bar">
+      <div class="context-info">
+        <svg class="context-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="2" y="3" width="12" height="10" rx="2" />
+          <path d="M2 6.5h12" />
+        </svg>
+        <span id="active-tab-host" class="context-host">Current tab</span>
+      </div>
+      <button id="btn-convert" class="btn btn-compact" title="Reopen current tab inside the selected container">
+        Assign Tab
       </button>
     </div>
 
-    <div id="containers-list" class="list"></div>
+    <!-- Container Composer -->
+    <section class="composer">
+      <div class="composer-top">
+        <div class="input-well">
+          <span id="active-swatch-dot" class="active-swatch-indicator"></span>
+          <input
+            id="container-name"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="container-id (e.g. acc-1)"
+            value="acc-1"
+          />
+        </div>
+        <div id="swatch-picker" class="swatch-group" role="radiogroup" aria-label="Container color">
+          <button type="button" class="swatch-btn active" data-color="blue" style="background: var(--swatch-blue)" title="Steel Blue"></button>
+          <button type="button" class="swatch-btn" data-color="orange" style="background: var(--swatch-orange)" title="Signal Amber"></button>
+          <button type="button" class="swatch-btn" data-color="green" style="background: var(--swatch-green)" title="Jade Sage"></button>
+          <button type="button" class="swatch-btn" data-color="purple" style="background: var(--swatch-purple)" title="Iris"></button>
+          <button type="button" class="swatch-btn" data-color="pink" style="background: var(--swatch-pink)" title="Rose"></button>
+          <button type="button" class="swatch-btn" data-color="cyan" style="background: var(--swatch-cyan)" title="Teal"></button>
+        </div>
+      </div>
 
-    <div class="note">
-      Works 100% standalone or with AI Agents. Containers created here automatically sync when the AI Hub connects.
+      <div class="composer-actions">
+        <button id="btn-create" type="button" class="btn" title="Save container to vault without closing popup">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+            <path d="M8 3.2v9.6M3.2 8h9.6" />
+          </svg>
+          <span>Save Container</span>
+        </button>
+        <button id="btn-open" type="button" class="btn btn-primary" title="Create container and open a new isolated tab">
+          <span>Open Container Tab</span>
+          <span class="kbd-hint">↵</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- Containers Vault List -->
+    <div class="section-header">
+      <span class="section-title">Isolated Containers</span>
+      <span id="containers-count" class="section-count">0</span>
     </div>
+
+    <div id="containers-list" class="containers-list"></div>
+
+    <!-- Technical Footer -->
+    <footer class="footer">
+      <span>DNR Cookie Vault · Isolated Storage</span>
+      <span id="active-tabs-summary">0 active tabs</span>
+    </footer>
 
     <script src="popup.js" type="module"></script>
   </body>
