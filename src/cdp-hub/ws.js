@@ -134,7 +134,13 @@ export class MiniWebSocket extends EventEmitter {
       }
     });
     socket.on('error', err => {
-      this.emit('error', err);
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', err);
+      }
+      if (this.readyState !== WS_STATE.CLOSED) {
+        this.readyState = WS_STATE.CLOSED;
+        this.emit('close', 1006, err?.message || '');
+      }
     });
   }
 

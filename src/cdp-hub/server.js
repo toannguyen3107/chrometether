@@ -578,6 +578,10 @@ export class CdpHubServer {
       }
     });
 
+    ws.on('error', () => {
+      // Handled by close event
+    });
+
     ws.on('close', () => {
       if (this.extSocket === ws) {
         this.extSocket = null;
@@ -1242,6 +1246,10 @@ export class CdpHubServer {
           this._sendMcpError(client, msg.id, err.message, msg.sessionId);
         }
       });
+    });
+
+    ws.on('error', () => {
+      // Handled by close event
     });
 
     ws.on('close', () => {
