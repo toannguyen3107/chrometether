@@ -655,6 +655,44 @@ export class CdpHubServer {
       return;
     }
 
+    if (msg.type === 'ext_sync_containers' && Array.isArray(msg.containers)) {
+      let vaultChanged = false;
+      for (const c of msg.containers) {
+        if (!c?.name) continue;
+        const entry = this.vault.ensureContainer(c.name, { color: c.color });
+        if (Array.isArray(c.cookies)) {
+          for (const cookie of c.cookies) {
+            if (!cookie?.name || !cookie?.domain) continue;
+            const exists = entry.cookies.some(
+              existing =>
+                existing.name === cookie.name &&
+                existing.domain === cookie.domain &&
+                existing.path === (cookie.path || '/')
+            );
+            if (!exists) {
+              entry.cookies.push(cookie);
+              vaultChanged = true;
+            }
+          }
+        }
+        if (c.localStorage && typeof c.localStorage === 'object') {
+          for (const [origin, bucket] of Object.entries(c.localStorage)) {
+            if (bucket && typeof bucket === 'object') {
+              entry.localStorage[origin] = {
+                ...(entry.localStorage[origin] || {}),
+                ...bucket
+              };
+              vaultChanged = true;
+            }
+          }
+        }
+      }
+      if (vaultChanged && this.vault.autoSave) {
+        this.vault.save();
+      }
+      return;
+    }
+
     if (msg.type === 'ext_tabs_snapshot' && Array.isArray(msg.tabs)) {
       const seenKeys = new Set();
       for (const t of msg.tabs) {

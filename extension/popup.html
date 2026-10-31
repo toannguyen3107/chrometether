@@ -6,7 +6,7 @@
     <style>
       body {
         font-family: system-ui, -apple-system, sans-serif;
-        width: 310px;
+        width: 340px;
         margin: 0;
         padding: 12px;
         background: #0f172a;
@@ -26,9 +26,6 @@
         font-size: 11px;
         padding: 2px 8px;
         border-radius: 999px;
-        background: #334155;
-      }
-      .status.connected {
         background: #065f46;
         color: #6ee7b7;
       }
@@ -56,15 +53,22 @@
         background: #2563eb;
         border-color: #3b82f6;
       }
+      button:hover {
+        filter: brightness(1.1);
+      }
       button.secondary {
         background: #334155;
         border-color: #475569;
-        width: 100%;
+      }
+      button.danger {
+        background: #7f1d1d;
+        border-color: #991b1b;
+        padding: 4px 7px;
       }
       .note {
         font-size: 11px;
         color: #94a3b8;
-        margin-top: 6px;
+        margin-top: 8px;
         line-height: 1.35;
       }
       .list {
@@ -74,6 +78,8 @@
         display: flex;
         flex-direction: column;
         gap: 6px;
+        max-height: 240px;
+        overflow-y: auto;
       }
       .item {
         display: flex;
@@ -84,16 +90,21 @@
         border-radius: 6px;
         font-size: 12px;
       }
+      .meta {
+        font-size: 10px;
+        color: #94a3b8;
+        display: block;
+      }
     </style>
   </head>
   <body>
     <div class="header">
       <span class="title">ChromeTether Containers</span>
-      <span id="hub-status" class="status">Standby</span>
+      <span id="hub-status" class="status">Ready</span>
     </div>
 
     <div class="row">
-      <input id="container-name" type="text" placeholder="Container (e.g. acc-1)" value="acc-1" />
+      <input id="container-name" type="text" placeholder="Name (e.g. acc-1, acc-2)" value="acc-1" />
       <select id="container-color">
         <option value="blue">🔵 Blue</option>
         <option value="orange">🟠 Orange</option>
@@ -105,19 +116,20 @@
     </div>
 
     <div class="row">
+      <button id="btn-create" class="secondary" style="flex: 1">+ Save Container</button>
       <button id="btn-open" style="flex: 1">+ New Container Tab</button>
     </div>
 
     <div class="row">
-      <button id="btn-convert" class="secondary">
-        Convert Current Tab (Reloads via about:blank)
+      <button id="btn-convert" class="secondary" style="width: 100%">
+        Move Current Tab into Selected Container
       </button>
     </div>
 
     <div id="containers-list" class="list"></div>
 
     <div class="note">
-      Same-window tabs with isolated Cookies (DNR tabIds) + localStorage/sessionStorage.
+      Works 100% standalone or with AI Agents. Containers created here automatically sync when the AI Hub connects.
     </div>
 
     <script src="popup.js" type="module"></script>
