@@ -37,6 +37,15 @@ Use the Chrome DevTools MCP tools when the target site is dynamic (React/Next.js
    - `list_console_messages()`: Check for JavaScript errors or warnings.
    - `list_network_requests()`: Verify backend API request/response statuses.
 
+## Multi-Account Container Tabs (Same Chrome Window) & Parallel Tasks
+
+When running multiple accounts on the same website or executing parallel browser tasks in the same Chrome window, use the `tether-containers` MCP tools together with `chrome-devtools`:
+- Call `list_containers()` to see existing persistent containers and their mapped `mcpIsolatedContextName` (`isolated-context-1`, `isolated-context-2`, ...).
+- Call `open_container_page(container, url, background)` (or `create_container(name, color)` followed by `new_page(url, background, isolatedContext)`) to open an isolated Container Tab in the **same Chrome window** (grouped visually with `chrome.tabGroups` badges such as `🔵 acc-1`, `🟠 acc-2`).
+- Alternatively, pass `#tether-container=<name>` in the target URL (`new_page(url: "https://example.com#tether-container=acc-1")`).
+- Always pass `pageId` (from `list_pages()`) to `take_snapshot(pageId)`, `click(uid, pageId)`, `fill(uid, value, pageId)`, and `evaluate_script(function, args, pageId)` so parallel agents never steal focus from each other (`background: true`).
+- Isolation scope covers HTTP/HTTPS/WS cookies (via Manifest V3 `declarativeNetRequest` `tabIds` rules), `document.cookie`, `window.cookieStore`, `localStorage`, and `sessionStorage`, with HTTP cache and site service workers disabled in container tabs. Note that `--category-extensions` and `--category-pwa` are not supported over `--ws-endpoint` until Chrome 149.
+
 ## Application mapping
 
 When asked to map an application, use the `application-mapping` skill and the `tether-map` MCP tools. Start a map for the target origin, record each visited page, pass observed Chrome network request metadata to `record_app_requests`, and finish with `get_app_map`. Only include additional API origins when they belong to the requested application.

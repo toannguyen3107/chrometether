@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ChromeTether Containers</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, sans-serif;
+        width: 310px;
+        margin: 0;
+        padding: 12px;
+        background: #0f172a;
+        color: #f8fafc;
+      }
+      .header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 10px;
+      }
+      .title {
+        font-weight: 700;
+        font-size: 14px;
+      }
+      .status {
+        font-size: 11px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #334155;
+      }
+      .status.connected {
+        background: #065f46;
+        color: #6ee7b7;
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+      input,
+      select,
+      button {
+        font-size: 12px;
+        border-radius: 6px;
+        border: 1px solid #334155;
+        background: #1e293b;
+        color: #f8fafc;
+        padding: 6px 8px;
+      }
+      input {
+        flex: 1;
+      }
+      button {
+        cursor: pointer;
+        font-weight: 600;
+        background: #2563eb;
+        border-color: #3b82f6;
+      }
+      button.secondary {
+        background: #334155;
+        border-color: #475569;
+        width: 100%;
+      }
+      .note {
+        font-size: 11px;
+        color: #94a3b8;
+        margin-top: 6px;
+        line-height: 1.35;
+      }
+      .list {
+        margin-top: 10px;
+        border-top: 1px solid #1e293b;
+        padding-top: 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: #1e293b;
+        padding: 6px 8px;
+        border-radius: 6px;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <span class="title">ChromeTether Containers</span>
+      <span id="hub-status" class="status">Standby</span>
+    </div>
+
+    <div class="row">
+      <input id="container-name" type="text" placeholder="Container (e.g. acc-1)" value="acc-1" />
+      <select id="container-color">
+        <option value="blue">🔵 Blue</option>
+        <option value="orange">🟠 Orange</option>
+        <option value="green">🟢 Green</option>
+        <option value="purple">🟣 Purple</option>
+        <option value="pink">🩷 Pink</option>
+        <option value="cyan">🩵 Cyan</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <button id="btn-open" style="flex: 1">+ New Container Tab</button>
+    </div>
+
+    <div class="row">
+      <button id="btn-convert" class="secondary">
+        Convert Current Tab (Reloads via about:blank)
+      </button>
+    </div>
+
+    <div id="containers-list" class="list"></div>
+
+    <div class="note">
+      Same-window tabs with isolated Cookies (DNR tabIds) + localStorage/sessionStorage.
+    </div>
+
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>

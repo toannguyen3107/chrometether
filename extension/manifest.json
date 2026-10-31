@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "ChromeTether Multi-Account Containers & CDP Bridge",
+  "version": "2.0.0",
+  "description": "Same-window Firefox-style Multi-Account Container Tabs (DNR Cookie Vault + Isolated Storage) and zero-dialog CDP bridge for ChromeTether AI agents.",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "cookies",
+    "storage",
+    "alarms",
+    "webRequest",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "ChromeTether Containers",
+    "default_popup": "popup.html"
+  }
+}
