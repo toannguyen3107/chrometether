@@ -1,8 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { mergeMcpConfig, getBrowserMcpConfigs } from '../src/installer/config-merger.js';
-import { detectAgents } from '../src/installer/agent-detector.js';
+import { mergeMcpConfig, getBrowserMcpConfigs } from '../../src/installer/config-merger.js';
+import { detectAgents } from '../../src/installer/agent-detector.js';
 
 function runMergerTest() {
   console.log('=== Testing Config Merger & Agent Detector ===\n');
@@ -22,7 +22,6 @@ function runMergerTest() {
   fs.mkdirSync(tempDir, { recursive: true });
   const mockConfigFile = path.join(tempDir, 'mock_config.json');
 
-  // Initial mock config with an existing custom server
   const initialConfig = {
     mcpServers: {
       my_custom_db: {
@@ -33,7 +32,6 @@ function runMergerTest() {
   };
   fs.writeFileSync(mockConfigFile, JSON.stringify(initialConfig, null, 2), 'utf8');
 
-  // Merge agy-browser configs
   const servers = getBrowserMcpConfigs(path.resolve('.'));
   const mergeResult = mergeMcpConfig(mockConfigFile, servers);
 
@@ -42,7 +40,6 @@ function runMergerTest() {
     process.exit(1);
   }
 
-  // Verify contents
   const updated = JSON.parse(fs.readFileSync(mockConfigFile, 'utf8'));
   if (!updated.mcpServers.my_custom_db) {
     console.error('❌ Existing server was lost during merge!');
@@ -64,7 +61,6 @@ function runMergerTest() {
   console.log('✔ Backup file created at:', mergeResult.backupFile);
   console.log('✔ Safe JSON merge PASSED!\n');
 
-  // Cleanup
   fs.rmSync(tempDir, { recursive: true, force: true });
   console.log('🎉 ALL CONFIG MERGER TESTS PASSED SUCCESSFULLY!');
 }

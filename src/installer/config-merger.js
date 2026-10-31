@@ -1,6 +1,5 @@
-import fs from 'fs';
+import nodeFs from 'fs';
 import path from 'path';
-import os from 'os';
 import { fileURLToPath } from 'url';
 import { parseJsonc } from './jsonc.js';
 
@@ -8,17 +7,13 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DEFAULT_PROJECT_DIR = path.resolve(__dirname, '..', '..');
 
-/**
- * Returns standard MCP server definitions for ChromeTether.
- * @param {string} projectDir - Absolute path to project root
- * @returns {object}
- */
-export function getBrowserMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
-  const normalizedProjectDir = path.resolve(projectDir);
-  const readerScript = path.join(normalizedProjectDir, 'src', 'reader-server', 'index.js');
-  const mapScript = path.join(normalizedProjectDir, 'src', 'app-map', 'server.js');
-  const chromeDevToolsScript = path.join(
-    normalizedProjectDir,
+export function getNodeCommand() {
+  return process.env.CHROMETETHER_NODE_COMMAND || process.execPath;
+}
+
+export function getChromeDevToolsScript(projectDir = DEFAULT_PROJECT_DIR) {
+  return path.join(
+    path.resolve(projectDir),
     'node_modules',
     'chrome-devtools-mcp',
     'build',
@@ -26,68 +21,104 @@ export function getBrowserMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
     'bin',
     'chrome-devtools-mcp.js'
   );
+}
+
+export function getPinnedDevToolsVersion(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs } = {}) {
+  try {
+    const pkgPath = path.join(path.resolve(projectDir), 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    const raw = pkg?.dependencies?.['chrome-devtools-mcp'] || '1.9.0';
+    return String(raw).replace(/^[\^~>=<\s]+/, '');
+  } catch {
+    return '1.9.0';
+  }
+}
+
+export function getChromeDevToolsLaunch(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs } = {}) {
+  const script = getChromeDevToolsScript(projectDir);
+  if (fs.existsSync(script)) {
+    return {
+      command: getNodeCommand(),
+      args: [script, '--auto-connect']
+    };
+  }
+  return {
+    command: 'npx',
+    args: ['-y', `chrome-devtools-mcp@${getPinnedDevToolsVersion(projectDir, { fs })}`, '--auto-connect'],
+    fallback: true
+  };
+}
+
+export function getServerLaunches(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs } = {}) {
+  const normalizedProjectDir = path.resolve(projectDir);
+  const nodeCmd = getNodeCommand();
+  const readerScript = path.join(normalizedProjectDir, 'src', 'reader-server', 'index.js');
+  const mapScript = path.join(normalizedProjectDir, 'src', 'app-map', 'server.js');
+  const devToolsLaunch = getChromeDevToolsLaunch(normalizedProjectDir, { fs });
 
   return {
     'chrome-devtools': {
-      command: 'node',
-      args: [
-        chromeDevToolsScript,
-        '--auto-connect'
-      ]
+      command: devToolsLaunch.command,
+      args: devToolsLaunch.args,
+      ...(devToolsLaunch.fallback ? { fallback: true } : {})
     },
     'tether-reader': {
-      command: 'node',
-      args: [
-        readerScript
-      ]
+      command: nodeCmd,
+      args: [readerScript]
     },
     'tether-map': {
-      command: 'node',
+      command: nodeCmd,
       args: [mapScript]
     }
   };
 }
 
 /**
- * Returns OpenCode-formatted MCP server definitions.
- * @param {string} projectDir
+ * Returns standard MCP server definitions for ChromeTether.
+ * @param {string} [projectDir] - Absolute path to project root
+ * @param {{ fs?: typeof nodeFs }} [options]
  * @returns {object}
  */
-export function getOpenCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
-  const normalizedProjectDir = path.resolve(projectDir);
-  const readerScript = path.join(normalizedProjectDir, 'src', 'reader-server', 'index.js');
-  const mapScript = path.join(normalizedProjectDir, 'src', 'app-map', 'server.js');
-  const chromeDevToolsScript = path.join(
-    normalizedProjectDir,
-    'node_modules',
-    'chrome-devtools-mcp',
-    'build',
-    'src',
-    'bin',
-    'chrome-devtools-mcp.js'
-  );
+export function getBrowserMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs } = {}) {
+  const launches = getServerLaunches(projectDir, { fs });
+  return {
+    'chrome-devtools': {
+      command: launches['chrome-devtools'].command,
+      args: launches['chrome-devtools'].args
+    },
+    'tether-reader': {
+      command: launches['tether-reader'].command,
+      args: launches['tether-reader'].args
+    },
+    'tether-map': {
+      command: launches['tether-map'].command,
+      args: launches['tether-map'].args
+    }
+  };
+}
 
+/**
+ * Returns OpenCode-formatted MCP server definitions.
+ * @param {string} [projectDir]
+ * @param {{ fs?: typeof nodeFs }} [options]
+ * @returns {object}
+ */
+export function getOpenCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs } = {}) {
+  const launches = getServerLaunches(projectDir, { fs });
   return {
     'chrome-devtools': {
       type: 'local',
-      command: [
-        'node',
-        chromeDevToolsScript,
-        '--auto-connect'
-      ],
+      command: [launches['chrome-devtools'].command, ...launches['chrome-devtools'].args],
       enabled: true
     },
     'tether-reader': {
       type: 'local',
-      command: [
-        'node',
-        readerScript
-      ],
+      command: [launches['tether-reader'].command, ...launches['tether-reader'].args],
       enabled: true
     },
     'tether-map': {
       type: 'local',
-      command: ['node', mapScript],
+      command: [launches['tether-map'].command, ...launches['tether-map'].args],
       enabled: true
     }
   };
@@ -95,43 +126,27 @@ export function getOpenCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
 
 /**
  * Returns ZCode-formatted MCP server definitions.
- * @param {string} projectDir
+ * @param {string} [projectDir]
+ * @param {{ fs?: typeof nodeFs }} [options]
  * @returns {object}
  */
-export function getZCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
-  const normalizedProjectDir = path.resolve(projectDir);
-  const readerScript = path.join(normalizedProjectDir, 'src', 'reader-server', 'index.js');
-  const mapScript = path.join(normalizedProjectDir, 'src', 'app-map', 'server.js');
-  const chromeDevToolsScript = path.join(
-    normalizedProjectDir,
-    'node_modules',
-    'chrome-devtools-mcp',
-    'build',
-    'src',
-    'bin',
-    'chrome-devtools-mcp.js'
-  );
-
+export function getZCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR, { fs = nodeFs } = {}) {
+  const launches = getServerLaunches(projectDir, { fs });
   return {
     'chrome-devtools': {
       type: 'stdio',
-      command: 'node',
-      args: [
-        chromeDevToolsScript,
-        '--auto-connect'
-      ]
+      command: launches['chrome-devtools'].command,
+      args: launches['chrome-devtools'].args
     },
     'tether-reader': {
       type: 'stdio',
-      command: 'node',
-      args: [
-        readerScript
-      ]
+      command: launches['tether-reader'].command,
+      args: launches['tether-reader'].args
     },
     'tether-map': {
       type: 'stdio',
-      command: 'node',
-      args: [mapScript]
+      command: launches['tether-map'].command,
+      args: launches['tether-map'].args
     }
   };
 }
@@ -141,18 +156,19 @@ export function getZCodeMcpConfigs(projectDir = DEFAULT_PROJECT_DIR) {
  * Creates an automatic backup (.bak) before modifying.
  * @param {string} configFilePath - Path to agent's config json
  * @param {object} serversToMerge - Object containing server definitions
- * @param {string|boolean} [format='standard'] - Format identifier ('standard', 'opencode', 'zcode')
- * @returns {{ success: boolean, backupFile?: string, filePath: string, error?: string }}
+ * @param {string|boolean} [format='standard'] - Format identifier ('standard', 'antigravity', 'opencode', 'zcode')
+ * @returns {{ success: boolean, backupFile?: string, filePath: string, serverKeys?: string[], error?: string }}
  */
 export function mergeMcpConfig(configFilePath, serversToMerge, format = 'standard') {
   try {
     const dir = path.dirname(configFilePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    if (!nodeFs.existsSync(dir)) {
+      nodeFs.mkdirSync(dir, { recursive: true });
     }
 
-    const isZCode = format === 'zcode' || configFilePath.toLowerCase().includes('.zcode');
-    const isOpenCode = format === 'opencode' || format === true || configFilePath.toLowerCase().includes('opencode');
+    const normalizedFormat = format === 'antigravity' ? 'standard' : format;
+    const isZCode = normalizedFormat === 'zcode' || configFilePath.toLowerCase().includes('.zcode');
+    const isOpenCode = normalizedFormat === 'opencode' || normalizedFormat === true || configFilePath.toLowerCase().includes('opencode');
 
     let currentConfig = {};
     if (isZCode) {
@@ -165,8 +181,8 @@ export function mergeMcpConfig(configFilePath, serversToMerge, format = 'standar
 
     let backupFile = null;
 
-    if (fs.existsSync(configFilePath)) {
-      const raw = fs.readFileSync(configFilePath, 'utf8');
+    if (nodeFs.existsSync(configFilePath)) {
+      const raw = nodeFs.readFileSync(configFilePath, 'utf8');
       try {
         currentConfig = isOpenCode ? parseJsonc(raw) : JSON.parse(raw);
       } catch (parseErr) {
@@ -198,25 +214,24 @@ export function mergeMcpConfig(configFilePath, serversToMerge, format = 'standar
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       backupFile = `${configFilePath}.${timestamp}.bak`;
-      fs.writeFileSync(backupFile, raw, 'utf8');
+      nodeFs.writeFileSync(backupFile, raw, 'utf8');
     }
 
-    // Merge servers without removing existing ones
-    if (isZCode) {
-      for (const [key, val] of Object.entries(serversToMerge)) {
-        currentConfig.mcp.servers[key] = val;
-      }
-    } else if (isOpenCode) {
-      for (const [key, val] of Object.entries(serversToMerge)) {
-        currentConfig.mcp[key] = val;
-      }
-    } else {
-      for (const [key, val] of Object.entries(serversToMerge)) {
-        currentConfig.mcpServers[key] = val;
-      }
+    // Merge servers without removing unrelated existing ones; clean up legacy agy-reader key
+    const targetMap = isZCode
+      ? currentConfig.mcp.servers
+      : isOpenCode
+      ? currentConfig.mcp
+      : currentConfig.mcpServers;
+
+    if (serversToMerge['tether-reader'] && targetMap['agy-reader']) {
+      delete targetMap['agy-reader'];
+    }
+    for (const [key, val] of Object.entries(serversToMerge)) {
+      targetMap[key] = val;
     }
 
-    fs.writeFileSync(configFilePath, JSON.stringify(currentConfig, null, 2), 'utf8');
+    nodeFs.writeFileSync(configFilePath, JSON.stringify(currentConfig, null, 2), 'utf8');
 
     return {
       success: true,

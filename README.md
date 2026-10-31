@@ -30,7 +30,7 @@ flowchart TD
 
 | Tier | Tools | Underlying Engine | Best Used For |
 | :--- | :--- | :--- | :--- |
-| **Tier 1: Fast Reader** | `read_url_content`, `search_web` | Lightweight HTTP GET + Cheerio + Turndown + DuckDuckGo | Reading documentation, API specs, blogs, GitHub issues/READMEs, and organic search. Runs in **~150ms** with **zero browser overhead**. |
+| **Tier 1: Fast Reader** | `read_url_content(url)`, `search_web(query, max_results, domain)` | Lightweight HTTP GET + Cheerio + Turndown + DuckDuckGo (HTML + Lite fallback) | Reading documentation, API specs, blogs, GitHub issues/READMEs, JSON/XML/plain text, and organic search (with optional `domain` filtering and ad/tracking removal). Runs in **~150ms** with **zero browser overhead**. |
 | **Tier 2: Live Chrome** | `chrome-devtools` (`navigate_page`, `click`, `fill`, `take_snapshot`, `take_screenshot`, `list_console_messages`, `list_network_requests`) | Official Google Chrome DevTools Protocol via `chrome-devtools-mcp` | Dynamic SPAs (React, Next.js, Vue), web apps, filling forms, submitting data, inspecting UI, diagnosing console errors, and capturing screenshots. |
 
 ### 2. Live Chrome Attachment (`--auto-connect`)
@@ -126,6 +126,13 @@ chrome.exe --remote-debugging-port=9222
 | **Cursor IDE** | `~/.cursor/mcp.json` | Cursor MCP server registration. |
 | **Windsurf (Codeium)** | `~/.codeium/windsurf/mcp_config.json` | Cascade MCP server registration. |
 | **Roo Code / Cline** | `cline_mcp_settings.json` | VS Code extension MCP configuration. |
+| **Google Antigravity (AGY)** | `~/.gemini/config/mcp_config.json` + `~/.gemini/config/plugins/agy-browser/` | Merges `tether-reader` & `tether-map` (skipping duplicate `chrome_devtools`) and installs plugin skills/rules. |
+| **DeepSeek Harness (dsh)** | `~/.dsh/profiles/web/cordis.patch.yml` | Configures `dsh` MCP client profile, skills, and `AGENTS.md`. |
+
+> **Environment Variables**:
+> * `CHROMETETHER_NODE_COMMAND`: Override the Node executable written to MCP configs (defaults to `process.execPath` so GUI apps work with `nvm`/`volta`/`fnm`; re-run `install` after upgrading Node, or set `CHROMETETHER_NODE_COMMAND=node`).
+> * `CHROMETETHER_HOME`: Override the home directory inspected by `status` and `install`.
+> * `CHROMETETHER_MAP_FILE`: Override the default `~/.chrometether/app-map.json` storage path.
 
 ---
 

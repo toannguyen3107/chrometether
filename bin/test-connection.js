@@ -1,7 +1,13 @@
 import { spawn } from 'child_process';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { fetchMarkdown } from '../src/reader-server/fetch-markdown.js';
 import { searchDDG } from '../src/reader-server/search-ddg.js';
+import { getChromeDevToolsLaunch, getNodeCommand } from '../src/installer/config-merger.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const projectDir = path.resolve(__dirname, '..');
 
 function testMcpServer(command, args, label, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
@@ -80,6 +86,7 @@ async function runHealthCheck() {
   console.log('====================================================\n');
 
   let allPassed = true;
+  const nodeCmd = getNodeCommand();
 
   // 1. Test Tier 1 Reader Engine
   console.log('--- Checking Tier 1: Fast Reader Engine ---');
@@ -102,8 +109,8 @@ async function runHealthCheck() {
   // 2. Test Tier 1 MCP Stdio Transport
   console.log('\n--- Checking Tier 1 MCP Stdio Server ---');
   try {
-    const readerScript = path.resolve('src/reader-server/index.js');
-    const res = await testMcpServer('node', [readerScript], 'tether-reader MCP');
+    const readerScript = path.join(projectDir, 'src', 'reader-server', 'index.js');
+    const res = await testMcpServer(nodeCmd, [readerScript], 'tether-reader MCP');
     console.log(`✔ tether-reader Stdio MCP: OK (Protocol ${res.result.protocolVersion || 'v1'})`);
   } catch (err) {
     allPassed = false;
@@ -113,8 +120,8 @@ async function runHealthCheck() {
   // 3. Test application map MCP Stdio Transport
   console.log('\n--- Checking Application Map MCP Server ---');
   try {
-    const mapScript = path.resolve('src/app-map/server.js');
-    const res = await testMcpServer('node', [mapScript], 'tether-map MCP');
+    const mapScript = path.join(projectDir, 'src', 'app-map', 'server.js');
+    const res = await testMcpServer(nodeCmd, [mapScript], 'tether-map MCP');
     console.log(`✔ tether-map Stdio MCP: OK (Protocol ${res.result.protocolVersion || 'v1'})`);
   } catch (err) {
     allPassed = false;
@@ -124,8 +131,9 @@ async function runHealthCheck() {
   // 4. Test Tier 2 Chrome DevTools MCP Stdio Transport
   console.log('\n--- Checking Tier 2 Chrome DevTools MCP Engine ---');
   try {
-    const devToolsScript = path.resolve('node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js');
-    const res = await testMcpServer('node', [devToolsScript, '--headless=true'], 'chrome-devtools-mcp');
+    const dtLaunch = getChromeDevToolsLaunch(projectDir);
+    const dtArgs = dtLaunch.args.map(a => a === '--auto-connect' ? '--headless=true' : a);
+    const res = await testMcpServer(dtLaunch.command, dtArgs, 'chrome-devtools-mcp');
     console.log(`✔ chrome-devtools-mcp Stdio: OK (Protocol ${res.result.protocolVersion || 'v1'})`);
   } catch (err) {
     allPassed = false;

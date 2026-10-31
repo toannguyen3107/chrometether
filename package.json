@@ -15,10 +15,11 @@
   "scripts": {
     "start-reader": "node src/reader-server/index.js",
     "start-map": "node src/app-map/server.js",
+    "test": "node --test test/*.test.js",
+    "test:network": "node test/smoke/reader-smoke.js && node bin/test-connection.js",
     "test-map": "node --test test/app-map.test.js",
-    "test-reader": "node test/reader-test.js",
-    "test-merger": "node test/merger-test.js && node --test test/installer-jsonc.test.js",
-    "test": "node bin/test-connection.js",
+    "test-reader": "node --test test/search-ddg.test.js test/fetch-markdown.test.js",
+    "test-merger": "node --test test/installer-jsonc.test.js test/agent-detector.test.js test/config-merger.test.js",
     "setup": "node bin/chrometether.js install",
     "status": "node bin/chrometether.js status"
   },

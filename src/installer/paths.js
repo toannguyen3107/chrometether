@@ -1,13 +1,18 @@
 import path from 'path';
 import os from 'os';
 
-const home = os.homedir();
-const isWindows = process.platform === 'win32';
-const isMac = process.platform === 'darwin';
-
-const appData = isWindows ? process.env.APPDATA || path.join(home, 'AppData', 'Roaming') : '';
+export function getHome() {
+  return process.env.CHROMETETHER_HOME || os.homedir();
+}
 
 export function getAgentPaths() {
+  const home = getHome();
+  const isWindows = process.platform === 'win32';
+  const isMac = process.platform === 'darwin';
+  const appData = isWindows
+    ? (process.env.CHROMETETHER_HOME ? path.join(home, 'AppData', 'Roaming') : (process.env.APPDATA || path.join(home, 'AppData', 'Roaming')))
+    : '';
+
   return {
     claudeDesktop: {
       name: 'Claude Desktop',
@@ -88,10 +93,17 @@ export function getAgentPaths() {
     antigravity: {
       name: 'Google Antigravity (AGY)',
       id: 'antigravity',
-      format: 'antigravity-plugin',
-      configPath: path.join(home, '.gemini', 'config', 'plugins', 'agy-browser', 'plugin.json'),
+      format: 'antigravity',
+      configPath: path.join(home, '.gemini', 'config', 'mcp_config.json'),
       appDir: path.join(home, '.gemini', 'antigravity'),
+      appDirs: [
+        path.join(home, '.gemini', 'antigravity'),
+        path.join(home, '.gemini', 'config')
+      ],
+      pluginsRoot: path.join(home, '.gemini', 'config', 'plugins'),
       pluginsDir: path.join(home, '.gemini', 'config', 'plugins', 'agy-browser'),
+      pluginManifestPath: path.join(home, '.gemini', 'config', 'plugins', 'agy-browser', 'plugin.json'),
+      pluginMcpConfigPath: path.join(home, '.gemini', 'config', 'plugins', 'agy-browser', 'mcp_config.json'),
     },
     dsh: {
       name: 'DeepSeek Harness (dsh)',

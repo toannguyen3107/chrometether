@@ -6,8 +6,8 @@ This agent environment is equipped with a **Dual-Tier Web Browsing & Automation 
 
 ### 1. Tier 1: Fast Reader (Lightweight HTTP)
 Use these tools first when you need to read content or search the web without executing JavaScript:
-* `read_url_content(url)`: Fetches an HTML page via HTTP GET and converts it to clean Markdown. Extremely fast (100–200ms) with zero browser overhead. Ideal for documentation, GitHub issues/READMEs, and static blogs.
-* `search_web(query, max_results)`: Fast organic search using DuckDuckGo to discover URLs and documentation.
+* `read_url_content(url)`: Fetches an HTML page via HTTP GET and converts it to clean Markdown. Extremely fast (100–200ms) with zero browser overhead. Ideal for documentation, GitHub issues/READMEs, and static blogs. Returns JSON, XML, Markdown and plain text verbatim; relative links are resolved to absolute URLs. Does not run JavaScript.
+* `search_web(query, max_results, domain)`: Fast organic search using DuckDuckGo to discover URLs and documentation. DuckDuckGo organic results only (ads and tracking redirects removed). Pass `domain` to prioritise one site, e.g. `domain: "developer.mozilla.org"`. On a bot challenge the tool falls back to DuckDuckGo Lite; if that also fails, wait a minute or search in Chrome.
 
 ### 2. Tier 2: Real Browser (`chrome-devtools`)
 Use the Chrome DevTools MCP tools when the target site is dynamic (React/Next.js/Vue), requires interaction (clicking, typing, login), or needs UI/console/network debugging.
@@ -30,9 +30,10 @@ Use the Chrome DevTools MCP tools when the target site is dynamic (React/Next.js
 5. **State Invalidation**:
    - If an action changes the page content or navigates away, previous `uid`s become stale. Call `take_snapshot()` again to refresh `uid`s.
 6. **Verification, Diagnostics & Screenshot Safety (CRITICAL)**:
-   - `take_screenshot(filePath)`: When taking a screenshot, **ALWAYS provide the `filePath` parameter** (e.g. saving to a temporary directory or scratch path).
+   - `take_screenshot(filePath)`: ALWAYS provide `filePath` (absolute, or relative to the server cwd, e.g. a scratch directory).
      > **CRITICAL**: Omitting `filePath` forces the MCP server to stream huge Base64 image data over standard IPC, which frequently causes `Tool execution timed out after 30000ms`.
      > Keep the Google Chrome window visible or unminimized; minimized windows trigger OS GPU rendering throttling and CDP timeouts.
+     > For full-page captures prefer `format: "jpeg"` with `quality: 60`.
    - `list_console_messages()`: Check for JavaScript errors or warnings.
    - `list_network_requests()`: Verify backend API request/response statuses.
 

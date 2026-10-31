@@ -1,5 +1,5 @@
-import { fetchMarkdown } from '../src/reader-server/fetch-markdown.js';
-import { searchDDG } from '../src/reader-server/search-ddg.js';
+import { fetchMarkdown } from '../../src/reader-server/fetch-markdown.js';
+import { searchDDG } from '../../src/reader-server/search-ddg.js';
 
 async function runTests() {
   console.log('=== Testing Tier 1: Fast Reader ===\n');
@@ -21,7 +21,7 @@ async function runTests() {
   try {
     const results = await searchDDG('Node.js website', 3);
     console.log(`✔ Found ${results.length} results:`);
-    results.forEach((r, i) => console.log(`   ${i + 1}. ${r.title} -> ${r.link}`));
+    results.forEach((r, i) => console.log(`   ${i + 1}. ${r.title} -> ${r.link} (${r.source})`));
     console.log('✔ searchDDG PASSED\n');
   } catch (err) {
     console.error('❌ searchDDG FAILED:', err.message);

@@ -12,11 +12,10 @@
         "src/app-map/server.js"
       ]
     },
-    "chrome_devtools": {
-      "command": "npx",
+    "chrome-devtools": {
+      "command": "node",
       "args": [
-        "-y",
-        "chrome-devtools-mcp@latest",
+        "node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js",
         "--auto-connect"
       ]
     }

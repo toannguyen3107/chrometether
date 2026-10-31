@@ -30,7 +30,7 @@ flowchart TD
 
 | Tầng công cụ | Công cụ | Cơ chế hoạt động | Ưu điểm & Trường hợp sử dụng |
 | :--- | :--- | :--- | :--- |
-| **Tầng 1: Đọc nhanh (Lightweight)** | `read_url_content`, `search_web` | HTTP GET + Cheerio + Turndown + DuckDuckGo | Đọc tài liệu lập trình, blog, GitHub README, tìm kiếm Google/DuckDuckGo nhanh. Tốn **0MB RAM**, phản hồi chỉ trong **~150ms**. |
+| **Tầng 1: Đọc nhanh (Lightweight)** | `read_url_content(url)`, `search_web(query, max_results, domain)` | HTTP GET + Cheerio + Turndown + DuckDuckGo (HTML + Lite fallback) | Đọc tài liệu lập trình, blog, GitHub README, JSON/XML/plain text, tìm kiếm DuckDuckGo nhanh (lọc sạch quảng cáo, hỗ trợ ưu tiên `domain`). Tốn **0MB RAM**, phản hồi chỉ trong **~150ms**. |
 | **Tầng 2: Chrome trực tiếp (Live Chrome)** | `chrome-devtools` (`navigate_page`, `click`, `fill`, `take_snapshot`, `take_screenshot`, `list_console_messages`, `list_network_requests`) | Chrome DevTools Protocol chính chủ từ Google | Tương tác Single Page App (React, Next.js, Vue), điền form, click nút, chụp ảnh màn hình, kiểm tra lỗi JavaScript Console & Network API. |
 
 ### 2. Bắt sóng Chrome đang mở (`--auto-connect`)
@@ -126,6 +126,13 @@ chrome.exe --remote-debugging-port=9222
 | **Cursor IDE** | `~/.cursor/mcp.json` | Cấu hình MCP cho Cursor. |
 | **Windsurf (Codeium)** | `~/.codeium/windsurf/mcp_config.json` | Cấu hình MCP cho Cascade. |
 | **Roo Code / Cline** | `cline_mcp_settings.json` | Cấu hình MCP cho extension VS Code. |
+| **Google Antigravity (AGY)** | `~/.gemini/config/mcp_config.json` + `~/.gemini/config/plugins/agy-browser/` | Đăng ký `tether-reader` & `tether-map` (bỏ qua `chrome_devtools` nếu đã có sẵn) và cài đặt bộ plugin skills/rules. |
+| **DeepSeek Harness (dsh)** | `~/.dsh/profiles/web/cordis.patch.yml` | Cấu hình MCP client profile, skills và `AGENTS.md` cho `dsh`. |
+
+> **Biến môi trường hỗ trợ**:
+> * `CHROMETETHER_NODE_COMMAND`: Ghi đè đường dẫn thực thi Node trong cấu hình MCP (mặc định dùng `process.execPath` để các ứng dụng GUI nhận diện đúng khi dùng `nvm`/`volta`/`fnm`; chạy lại `install` sau khi nâng cấp Node hoặc đặt `CHROMETETHER_NODE_COMMAND=node`).
+> * `CHROMETETHER_HOME`: Ghi đè thư mục home khi chạy `status` và `install`.
+> * `CHROMETETHER_MAP_FILE`: Đổi đường dẫn lưu file bản đồ ứng dụng (mặc định `~/.chrometether/app-map.json`).
 
 ---
 
