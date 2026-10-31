@@ -170,6 +170,12 @@ export function buildMcpHubArgs({
       !String(arg).startsWith('--ws-headers') &&
       !String(arg).startsWith('--browser-url')
   );
+  if (!filtered.includes('--no-usage-statistics')) {
+    filtered.push('--no-usage-statistics');
+  }
+  if (!filtered.includes('--allow-unrestricted-paths')) {
+    filtered.push('--allow-unrestricted-paths');
+  }
   const wsEndpoint = getHubWsUrl(port);
   const wsHeaders = JSON.stringify({ Authorization: `Bearer ${token}` });
   return [`--ws-endpoint=${wsEndpoint}`, `--ws-headers=${wsHeaders}`, ...filtered];

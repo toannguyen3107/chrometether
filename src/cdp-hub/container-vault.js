@@ -597,7 +597,7 @@ export class ContainerVault {
    * Virtualizes `document.cookie` (non-HttpOnly), `window.cookieStore`, `localStorage`,
    * `sessionStorage`, and blocks shared `serviceWorker.register` inside container tabs.
    */
-  buildInitScript(rawName) {
+  buildInitScript(rawName, { sessionStorage = null } = {}) {
     const entry = this.ensureContainer(rawName);
     const now = Date.now();
     const jsCookies = entry.cookies
@@ -617,7 +617,7 @@ export class ContainerVault {
       container: entry.name,
       cookies: jsCookies,
       localStorage: entry.localStorage || {},
-      sessionStorage: entry.sessionStorage || {}
+      sessionStorage: sessionStorage || entry.sessionStorage || {}
     });
 
     return `(() => {
@@ -632,14 +632,54 @@ export class ContainerVault {
   const rawSyncBinding = typeof window.__chrometether_vault_sync === 'function'
     ? window.__chrometether_vault_sync
     : null;
+  let activeSyncBinding = rawSyncBinding;
   try {
     delete window.__chrometether_vault_sync;
   } catch {}
+  const getSyncBinding = () => {
+    if (typeof window.__chrometether_vault_sync === 'function') {
+      activeSyncBinding = window.__chrometether_vault_sync;
+      try {
+        delete window.__chrometether_vault_sync;
+      } catch {}
+    }
+    return activeSyncBinding;
+  };
 
   const state = ${initialPayload};
+  try {
+    Object.defineProperty(window, '__chrometether_receive_state', {
+      value: (incoming) => {
+        if (!incoming || typeof incoming !== 'object') return;
+        if (Array.isArray(incoming.cookies)) {
+          state.cookies.length = 0;
+          for (const c of incoming.cookies) state.cookies.push(c);
+        }
+        if (incoming.localStorage && typeof incoming.localStorage === 'object') {
+          for (const k of ObjectKeys(state.localStorage)) {
+            if (!ObjectHasOwn.call(incoming.localStorage, k)) delete state.localStorage[k];
+          }
+          for (const origin of ObjectKeys(incoming.localStorage)) {
+            const srcBucket = incoming.localStorage[origin] || {};
+            if (!state.localStorage[origin]) state.localStorage[origin] = {};
+            const dstBucket = state.localStorage[origin];
+            for (const bk of ObjectKeys(dstBucket)) {
+              if (!ObjectHasOwn.call(srcBucket, bk)) delete dstBucket[bk];
+            }
+            for (const bk of ObjectKeys(srcBucket)) {
+              dstBucket[bk] = srcBucket[bk];
+            }
+          }
+        }
+      },
+      configurable: false,
+      enumerable: false,
+      writable: false
+    });
+  } catch {}
   const notifyHub = (payload) => {
     try {
-      const fn = rawSyncBinding || (typeof window.__chrometether_vault_sync === 'function' ? window.__chrometether_vault_sync : null);
+      const fn = getSyncBinding();
       if (fn) {
         fn(JSONStringify({ ...payload }));
       }

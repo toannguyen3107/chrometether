@@ -216,6 +216,19 @@ test('CdpHubServer + simulated Extension creates same-window Container Tabs, cap
         extReceivedRequests.push(msg);
         if (msg.action === 'create_tab') {
           const tabId = ++nextChromeTabId;
+          // Simulate premature chrome.tabs.onUpdated firing before create_tab finishes
+          extWs.send(
+            JSON.stringify({
+              type: 'ext_tab_updated',
+              tab: {
+                tabId,
+                windowId: 1,
+                url: 'about:blank',
+                title: '',
+                containerName: null
+              }
+            })
+          );
           extWs.send(
             JSON.stringify({
               type: 'hub_response',
@@ -256,6 +269,8 @@ test('CdpHubServer + simulated Extension creates same-window Container Tabs, cap
     });
     const rpc = createRpcClient(mcpWs);
 
+    await rpc.send('Target.setDiscoverTargets', { discover: true });
+    await rpc.send('Target.setAutoAttach', { autoAttach: true, flatten: true });
     const createdCtx = await rpc.send('Target.createBrowserContext', {});
     assert.equal(createdCtx.browserContextId, 'tether-ctx-acc-1');
 
@@ -265,6 +280,13 @@ test('CdpHubServer + simulated Extension creates same-window Container Tabs, cap
       browserContextId: createdCtx.browserContextId
     });
     assert.equal(targetRes.targetId, 'page-11');
+
+    // Verify Target.attachedToTarget was emitted only ONCE for tab-11 and with browserContextId: 'tether-ctx-acc-1'
+    const tab11Attaches = rpc.events.filter(
+      e => e.method === 'Target.attachedToTarget' && e.params?.targetInfo?.targetId === 'tab-11'
+    );
+    assert.equal(tab11Attaches.length, 1);
+    assert.equal(tab11Attaches[0].params.targetInfo.browserContextId, 'tether-ctx-acc-1');
 
     // Verify Extension received create_tab in the same window with initScript and badge
     const createTabReq = extReceivedRequests.find(r => r.action === 'create_tab');
@@ -528,6 +550,13 @@ test('tether-containers MCP tool handlers create, list, open, and clear containe
     const cleared = await handleContainerToolCall('clear_container', { name: 'acc-1' });
     assert.equal(cleared.ok, true);
     assert.equal(cleared.cleared, true);
+
+    const deleted = await handleContainerToolCall('delete_container', { name: 'acc-1' });
+    assert.equal(deleted.ok, true);
+    assert.equal(deleted.deleted, true);
+
+    const listedAfterDelete = await handleContainerToolCall('list_containers', {});
+    assert.equal(listedAfterDelete.containers.length, 0);
   } finally {
     await hub.stop();
     if (prevFile === undefined) delete process.env.CHROMETETHER_CONTAINERS_FILE;
