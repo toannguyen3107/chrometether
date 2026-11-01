@@ -590,3 +590,48 @@ test('tether-containers MCP tool handlers create, list, open, and clear containe
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('CdpHubServer ignores late ext_tab_updated for closed tabs so zombie targets never resurrect', async () => {
+  const vault = new ContainerVault({ autoSave: false });
+  const hub = new CdpHubServer({
+    port: 0,
+    token: 'zombie-test-token',
+    requireAuth: false,
+    vault
+  });
+  await hub.start();
+  try {
+    hub._handleExtensionMessage({
+      type: 'ext_tab_updated',
+      tab: {
+        tabId: 777,
+        windowId: 1,
+        url: 'https://www.expedia.com/',
+        title: 'Expedia',
+        containerName: 'acc-1'
+      }
+    });
+    assert.equal(hub.tabs.has('777'), true);
+
+    hub._handleExtensionMessage({
+      type: 'ext_tab_removed',
+      tabId: 777
+    });
+    assert.equal(hub.tabs.has('777'), false);
+
+    // Simulate late async chrome.tabs.onUpdated({ groupId: -1 }) arriving after ext_tab_removed
+    hub._handleExtensionMessage({
+      type: 'ext_tab_updated',
+      tab: {
+        tabId: 777,
+        windowId: 1,
+        url: 'https://www.expedia.com/',
+        title: 'Expedia',
+        containerName: null
+      }
+    });
+    assert.equal(hub.tabs.has('777'), false);
+  } finally {
+    await hub.stop();
+  }
+});
