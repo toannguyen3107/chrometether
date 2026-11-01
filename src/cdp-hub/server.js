@@ -814,10 +814,14 @@ export class CdpHubServer {
     if (msg.type === 'ext_tabs_snapshot' && Array.isArray(msg.tabs)) {
       const seenKeys = new Set();
       for (const t of msg.tabs) {
-        const existingTab = this.tabs.get(String(t.tabId));
+        const key = String(t.tabId);
+        if (this._closedTabKeys?.has(key)) {
+          continue;
+        }
+        const existingTab = this.tabs.get(key);
         const wasKnown = Boolean(existingTab);
         if (!wasKnown && this._pendingCreateTabCount > 0) {
-          seenKeys.add(String(t.tabId));
+          seenKeys.add(key);
           continue;
         }
         const prevContainer = existingTab?.containerName || null;
@@ -845,7 +849,11 @@ export class CdpHubServer {
 
     if (msg.type === 'ext_tab_updated' && msg.tab) {
       const t = msg.tab;
-      const wasKnown = this.tabs.has(String(t.tabId));
+      const key = String(t.tabId);
+      if (this._closedTabKeys?.has(key)) {
+        return;
+      }
+      const wasKnown = this.tabs.has(key);
       if (!wasKnown && this._pendingCreateTabCount > 0) {
         return;
       }
@@ -1069,16 +1077,7 @@ export class CdpHubServer {
     }
 
     const entry = this.vault.getContainer(tab.containerName);
-    const slotId = getTabDnrSlotId(numericTabId);
     try {
-      if (rulesChanged && slotId > 0 && slotId !== numericTabId && !tab._slotClearedOnce) {
-        // Ensure backward-compatibility if an unpatched Extension Service Worker is still loaded in Chrome memory
-        await this._sendExtensionRequest('update_tab_dnr_rules', {
-          tabId: slotId,
-          rules: []
-        }).catch(() => {});
-        tab._slotClearedOnce = true;
-      }
       await this._sendExtensionRequest('update_tab_dnr_rules', {
         tabId: numericTabId,
         containerName: tab.containerName,
@@ -1288,16 +1287,21 @@ export class CdpHubServer {
       this._pendingCreateTabCount = (this._pendingCreateTabCount || 0) + 1;
       let tab;
       try {
-        const res = await this._sendExtensionRequest('create_tab', {
-          url: container ? 'about:blank' : targetUrl,
-          background,
-          containerName: container ? container.name : null,
-          color: container ? container.color : null,
-          badge: container ? container.badge : null,
-          initScript,
-          cookies: container ? container.cookies : undefined,
-          localStorage: container ? container.localStorage : undefined
-        });
+        const res = await this._sendExtensionRequest(
+          'create_tab',
+          {
+            url: container ? 'about:blank' : targetUrl,
+            background,
+            containerName: container ? container.name : null,
+            color: container ? container.color : null,
+            badge: container ? container.badge : null,
+            initScript,
+            cookies: container ? container.cookies : undefined,
+            localStorage: container ? container.localStorage : undefined
+          },
+          20000
+        );
+        this._closedTabKeys?.delete(String(res.tabId));
         tab = this._ensureTabRecord({
           tabId: res.tabId,
           url: targetUrl,
@@ -1769,10 +1773,18 @@ export class CdpHubServer {
   }
 
   _handleTabClosed(tabKey, { pruneEmptyContainer = true } = {}) {
-    const tab = this.tabs.get(String(tabKey));
+    const key = String(tabKey);
+    if (!this._closedTabKeys) this._closedTabKeys = new Set();
+    if (this._closedTabKeys.size > 500) {
+      const oldest = this._closedTabKeys.values().next().value;
+      this._closedTabKeys.delete(oldest);
+    }
+    this._closedTabKeys.add(key);
+
+    const tab = this.tabs.get(key);
     if (!tab) return;
     const prevContainer = tab.containerName || null;
-    this.tabs.delete(String(tabKey));
+    this.tabs.delete(key);
 
     for (const client of this.mcpClients.values()) {
       for (const [vSessionId, sInfo] of client.sessions.entries()) {

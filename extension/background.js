@@ -879,14 +879,53 @@ async function restoreSessionState() {
         if (Number.isInteger(tabId) && v?.containerName) {
           const name = normalizeName(v.containerName);
           if (deletedContainerNames.has(name)) continue;
-          tabContainers.set(tabId, { ...v, containerName: name });
+          const color = COLOR_BADGES[v.color] ? v.color : 'blue';
+          const sessionStorage =
+            v.sessionStorage && typeof v.sessionStorage === 'object' ? v.sessionStorage : undefined;
+          tabContainers.set(tabId, {
+            containerName: name,
+            color,
+            badge: v.badge || COLOR_BADGES[color] || '🔵',
+            groupId: Number.isInteger(v.groupId) && v.groupId > 0 ? v.groupId : undefined,
+            sessionStorage,
+            initScript: buildInitScriptForLocalContainer(name, sessionStorage || null)
+          });
         }
       }
     }
     await reconcileTabsAndGroupsWithChrome();
+    for (const [tabId, info] of tabContainers.entries()) {
+      if (info?.containerName) {
+        const rules = buildDnrRulesForLocalContainerTab(info.containerName, tabId);
+        await updateTabDnrSessionRules(tabId, rules);
+      }
+    }
   } catch {
     // ignore
   }
+}
+
+function withStepTimeout(promise, ms = 2500, fallback = null) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(promise).catch(() => fallback),
+    new Promise(resolve => {
+      timer = setTimeout(() => resolve(fallback), ms);
+    })
+  ]).finally(() => clearTimeout(timer));
+}
+
+const closedTabIds = new Set();
+const tabsWithDnrRules = new Set();
+
+function markTabClosed(tabId) {
+  const numericTabId = Number(tabId);
+  if (!Number.isInteger(numericTabId) || numericTabId <= 0) return;
+  if (closedTabIds.size > 500) {
+    const oldest = closedTabIds.values().next().value;
+    closedTabIds.delete(oldest);
+  }
+  closedTabIds.add(numericTabId);
 }
 
 async function persistVaultAndTabs() {
@@ -899,16 +938,25 @@ async function persistVaultAndTabs() {
       cookies: c.cookies,
       localStorage: c.localStorage
     }));
-    await chrome.storage.local.set({
-      containersVault,
-      deletedContainerNames: Array.from(deletedContainerNames)
-    });
+    await withStepTimeout(
+      chrome.storage.local.set({
+        containersVault,
+        deletedContainerNames: Array.from(deletedContainerNames)
+      }),
+      1500
+    );
 
     const serializedTabs = {};
     for (const [tabId, info] of tabContainers.entries()) {
-      serializedTabs[tabId] = info;
+      serializedTabs[tabId] = {
+        containerName: info.containerName,
+        color: info.color,
+        badge: info.badge,
+        groupId: info.groupId,
+        sessionStorage: info.sessionStorage
+      };
     }
-    await chrome.storage.session.set({ tabContainers: serializedTabs });
+    await withStepTimeout(chrome.storage.session.set({ tabContainers: serializedTabs }), 1500);
   } catch {
     // ignore
   }
@@ -1019,7 +1067,12 @@ async function reconcileTabsAndGroupsWithChrome() {
         attachingTabs.delete(tabId);
         await clearTabDnrSessionRules(tabId);
         changed = true;
-      } else if (!info.groupingInProgress && (liveTab.groupId === undefined || liveTab.groupId === -1)) {
+      } else if (
+        !info.groupingInProgress &&
+        !initializingTabs.has(tabId) &&
+        info.groupId > 0 &&
+        (liveTab.groupId === undefined || liveTab.groupId === -1)
+      ) {
         tabContainers.delete(tabId);
         await clearTabDnrSessionRules(tabId);
         changed = true;
@@ -1030,6 +1083,18 @@ async function reconcileTabsAndGroupsWithChrome() {
           ensureContainerInLocalVault(info.containerName, info.color);
           changed = true;
         }
+      } else if (
+        !info.groupingInProgress &&
+        !initializingTabs.has(tabId) &&
+        (!info.groupId || info.groupId === -1)
+      ) {
+        placeTabInContainerGroup(
+          tabId,
+          liveTab.windowId,
+          info.containerName,
+          info.color,
+          info.badge
+        ).catch(() => {});
       }
     }
 
@@ -1131,6 +1196,7 @@ async function deleteContainerLocal(
     const tabIds = Array.from(tabIdsToProcess);
     if (tabIds.length > 0) {
       if (closeTabs) {
+        for (const tId of tabIds) markTabClosed(tId);
         await chrome.tabs.remove(tabIds).catch(() => {});
       } else {
         await chrome.tabs.ungroup(tabIds).catch(() => {});
@@ -1161,8 +1227,12 @@ async function updateTabDnrSessionRules(tabId, newRules = []) {
   if (!Number.isInteger(numericTabId) || numericTabId <= 0) return;
 
   const info = tabContainers.get(numericTabId);
-  const rulesJson = JSON.stringify(newRules);
-  if (newRules.length > 0 && info && info.appliedDnrRulesJson === rulesJson) {
+  const rulesJson = newRules.length > 0 ? JSON.stringify(newRules) : null;
+  if (newRules.length === 0) {
+    if (!tabsWithDnrRules.has(numericTabId) && (!info || !info.appliedDnrRulesJson)) {
+      return;
+    }
+  } else if (info && info.appliedDnrRulesJson === rulesJson && tabsWithDnrRules.has(numericTabId)) {
     return;
   }
 
@@ -1170,29 +1240,45 @@ async function updateTabDnrSessionRules(tabId, newRules = []) {
   const maxId = minId + 99;
   const newRuleIds = new Set(newRules.map(r => r.id));
 
-  const next = dnrUpdateChain.catch(() => {}).then(async () => {
-    try {
-      const existing = await chrome.declarativeNetRequest.getSessionRules();
-      const removeRuleIds = existing
-        .filter(
-          r =>
-            (r.id >= minId && r.id <= maxId) ||
-            newRuleIds.has(r.id) ||
-            (Array.isArray(r.condition?.tabIds) && r.condition.tabIds.includes(numericTabId))
-        )
-        .map(r => r.id);
+  const next = dnrUpdateChain.catch(() => {}).then(() =>
+    withStepTimeout(
+      (async () => {
+        try {
+          const existing = await chrome.declarativeNetRequest.getSessionRules();
+          const removeRuleIds = existing
+            .filter(
+              r =>
+                (r.id >= minId && r.id <= maxId) ||
+                newRuleIds.has(r.id) ||
+                (Array.isArray(r.condition?.tabIds) && r.condition.tabIds.includes(numericTabId))
+            )
+            .map(r => r.id);
 
-      await chrome.declarativeNetRequest.updateSessionRules({
-        removeRuleIds,
-        addRules: newRules
-      });
-      if (info) {
-        info.appliedDnrRulesJson = newRules.length > 0 ? rulesJson : null;
-      }
-    } catch (err) {
-      console.warn('DNR updateSessionRules error for tab', numericTabId, err);
-    }
-  });
+          if (removeRuleIds.length === 0 && newRules.length === 0) {
+            tabsWithDnrRules.delete(numericTabId);
+            if (info) info.appliedDnrRulesJson = null;
+            return;
+          }
+
+          await chrome.declarativeNetRequest.updateSessionRules({
+            removeRuleIds,
+            addRules: newRules
+          });
+          if (newRules.length > 0) {
+            tabsWithDnrRules.add(numericTabId);
+          } else {
+            tabsWithDnrRules.delete(numericTabId);
+          }
+          if (info) {
+            info.appliedDnrRulesJson = rulesJson;
+          }
+        } catch (err) {
+          console.warn('DNR updateSessionRules error for tab', numericTabId, err);
+        }
+      })(),
+      2500
+    )
+  );
   dnrUpdateChain = next;
   return next;
 }
@@ -1322,8 +1408,14 @@ async function ensureDebuggerAttached(tabId) {
     return attachingTabs.get(numericTabId);
   }
   const promise = (async () => {
+    let timer;
     try {
-      await chrome.debugger.attach({ tabId: numericTabId }, '1.3');
+      await Promise.race([
+        chrome.debugger.attach({ tabId: numericTabId }, '1.3'),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Debugger attach timed out')), 2500);
+        })
+      ]);
       attachedTabs.add(numericTabId);
       return true;
     } catch (err) {
@@ -1334,6 +1426,7 @@ async function ensureDebuggerAttached(tabId) {
       }
       return false;
     } finally {
+      clearTimeout(timer);
       attachingTabs.delete(numericTabId);
     }
   })();
@@ -1350,29 +1443,35 @@ async function configureContainerDebuggerOnTab(tabId, containerInfo) {
   }
 
   const target = { tabId: numericTabId };
-  try {
-    await chrome.debugger.sendCommand(target, 'Network.enable', {});
-    await chrome.debugger.sendCommand(target, 'Network.setCacheDisabled', {
-      cacheDisabled: true
-    });
-    await chrome.debugger.sendCommand(target, 'Network.setBypassServiceWorker', {
-      bypass: true
-    });
-    await chrome.debugger.sendCommand(target, 'Runtime.enable', {});
-    await chrome.debugger.sendCommand(target, 'Runtime.addBinding', {
-      name: '__chrometether_vault_sync'
-    });
-    await chrome.debugger.sendCommand(target, 'Page.enable', {});
-    await chrome.debugger
-      .sendCommand(target, 'Page.setLifecycleEventsEnabled', { enabled: true })
-      .catch(() => {});
-    const scriptSource =
-      containerInfo.initScript || buildInitScriptForLocalContainer(containerInfo.containerName);
-    await refreshTabInitScript(numericTabId, containerInfo, scriptSource);
-    return true;
-  } catch {
-    return false;
-  }
+  return withStepTimeout(
+    (async () => {
+      try {
+        await chrome.debugger.sendCommand(target, 'Network.enable', {});
+        await chrome.debugger.sendCommand(target, 'Network.setCacheDisabled', {
+          cacheDisabled: true
+        });
+        await chrome.debugger.sendCommand(target, 'Network.setBypassServiceWorker', {
+          bypass: true
+        });
+        await chrome.debugger.sendCommand(target, 'Runtime.enable', {});
+        await chrome.debugger.sendCommand(target, 'Runtime.addBinding', {
+          name: '__chrometether_vault_sync'
+        });
+        await chrome.debugger.sendCommand(target, 'Page.enable', {});
+        await chrome.debugger
+          .sendCommand(target, 'Page.setLifecycleEventsEnabled', { enabled: true })
+          .catch(() => {});
+        const scriptSource =
+          containerInfo.initScript || buildInitScriptForLocalContainer(containerInfo.containerName);
+        await refreshTabInitScript(numericTabId, containerInfo, scriptSource);
+        return true;
+      } catch {
+        return false;
+      }
+    })(),
+    3000,
+    false
+  );
 }
 
 const groupingLocks = new Map();
@@ -1390,35 +1489,58 @@ async function placeTabInContainerGroup(
   const prevLock = groupingLocks.get(cleanName) || Promise.resolve();
   const nextLock = prevLock
     .catch(() => {})
-    .then(async () => {
-      try {
-        // Chrome tabGroups already render a colored pill (blue, orange, green, etc.) — keep title crisp without emoji clutter
-        const title = String(cleanName);
-        const existingGroups = await chrome.tabGroups.query({ windowId, title });
-        if (existingGroups && existingGroups.length > 0) {
-          const gId = existingGroups[0].id;
-          groupContainers.set(gId, cleanName);
-          await chrome.tabs.group({ groupId: gId, tabIds: [tabId] });
-          if (info) info.groupId = gId;
-          return gId;
-        }
-        const groupId = await chrome.tabs.group({
-          createProperties: windowId ? { windowId } : undefined,
-          tabIds: [tabId]
-        });
-        groupContainers.set(groupId, cleanName);
-        if (info) info.groupId = groupId;
-        await chrome.tabGroups.update(groupId, {
-          title,
-          color: color || 'blue',
-          collapsed: false
-        });
-        return groupId;
-      } catch {
-        return null;
-      } finally {
-        if (info) info.groupingInProgress = false;
-      }
+    .then(() =>
+      withStepTimeout(
+        (async () => {
+          try {
+            if (closedTabIds.has(Number(tabId))) return null;
+            // Chrome tabGroups already render a colored pill (blue, orange, green, etc.) — keep title crisp without emoji clutter
+            const title = String(cleanName);
+            const existingGroups = await chrome.tabGroups
+              .query(windowId ? { windowId, title } : { title })
+              .catch(() => []);
+            if (existingGroups && existingGroups.length > 0) {
+              const gId = existingGroups[0].id;
+              try {
+                await chrome.tabs.group({ groupId: gId, tabIds: [tabId] });
+                groupContainers.set(gId, cleanName);
+                if (info) info.groupId = gId;
+                return gId;
+              } catch {
+                // Fall through to create a fresh group if existing groupId became stale
+              }
+            }
+            let groupId;
+            try {
+              groupId = await chrome.tabs.group({
+                createProperties: windowId ? { windowId } : undefined,
+                tabIds: [tabId]
+              });
+            } catch {
+              groupId = await chrome.tabs.group({ tabIds: [tabId] });
+            }
+            groupContainers.set(groupId, cleanName);
+            if (info) info.groupId = groupId;
+            await chrome.tabGroups
+              .update(groupId, {
+                title,
+                color: color || 'blue',
+                collapsed: false
+              })
+              .catch(() => {});
+            return groupId;
+          } catch {
+            return null;
+          } finally {
+            if (info) info.groupingInProgress = false;
+          }
+        })(),
+        2000,
+        null
+      )
+    )
+    .finally(() => {
+      if (info) info.groupingInProgress = false;
     });
   groupingLocks.set(cleanName, nextLock);
   try {
@@ -1449,6 +1571,7 @@ async function createContainerTabLocal({
       url: 'about:blank',
       active: !background
     });
+    closedTabIds.delete(created.id);
     initializingTabs.add(created.id);
   } finally {
     creatingTabCount = Math.max(0, creatingTabCount - 1);
@@ -1477,6 +1600,7 @@ async function createContainerTabLocal({
           ? initialDnrRules
           : buildDnrRulesForLocalContainerTab(entry.name, tabId);
       await updateTabDnrSessionRules(tabId, dnrRules);
+      await configureContainerDebuggerOnTab(tabId, info);
       await placeTabInContainerGroup(
         tabId,
         created.windowId,
@@ -1484,7 +1608,6 @@ async function createContainerTabLocal({
         info.color,
         info.badge
       );
-      await configureContainerDebuggerOnTab(tabId, info);
       await persistVaultAndTabs();
       broadcastPopupState();
       if (!fromHub) {
@@ -1494,17 +1617,22 @@ async function createContainerTabLocal({
       const ok = await ensureDebuggerAttached(tabId);
       if (ok) {
         const target = { tabId };
-        await chrome.debugger.sendCommand(target, 'Network.enable', {}).catch(() => {});
-        await chrome.debugger.sendCommand(target, 'Runtime.enable', {}).catch(() => {});
-        await chrome.debugger.sendCommand(target, 'Page.enable', {}).catch(() => {});
-        await chrome.debugger
-          .sendCommand(target, 'Page.setLifecycleEventsEnabled', { enabled: true })
-          .catch(() => {});
+        await withStepTimeout(
+          Promise.all([
+            chrome.debugger.sendCommand(target, 'Network.enable', {}).catch(() => {}),
+            chrome.debugger.sendCommand(target, 'Runtime.enable', {}).catch(() => {}),
+            chrome.debugger.sendCommand(target, 'Page.enable', {}).catch(() => {}),
+            chrome.debugger
+              .sendCommand(target, 'Page.setLifecycleEventsEnabled', { enabled: true })
+              .catch(() => {})
+          ]),
+          2500
+        );
       }
     }
 
     if (url && url !== 'about:blank') {
-      await chrome.tabs.update(tabId, { url });
+      await withStepTimeout(chrome.tabs.update(tabId, { url }), 3000);
     }
   } finally {
     initializingTabs.delete(tabId);
@@ -1672,6 +1800,8 @@ async function handleHubRequest(msg) {
       result = { ok: true };
     } else if (action === 'close_tab') {
       const numericTabId = Number(params.tabId);
+      markTabClosed(numericTabId);
+      initializingTabs.delete(numericTabId);
       const info = tabContainers.get(numericTabId);
       await clearTabDnrSessionRules(numericTabId);
       tabContainers.delete(numericTabId);
@@ -1818,10 +1948,34 @@ chrome.tabs.onCreated.addListener(async tab => {
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (closedTabIds.has(tabId)) return;
   if (changeInfo.groupId !== undefined) {
     if (changeInfo.groupId === -1 && tabContainers.has(tabId)) {
       const info = tabContainers.get(tabId);
-      if (info && !info.groupingInProgress && !removingContainers.has(info.containerName)) {
+      if (
+        info &&
+        info.groupId > 0 &&
+        !info.groupingInProgress &&
+        !initializingTabs.has(tabId) &&
+        !removingContainers.has(info.containerName)
+      ) {
+        // Wait briefly because Chrome fires onUpdated({ groupId: -1 }) right before onRemoved when a grouped tab closes
+        await new Promise(r => setTimeout(r, 150));
+        if (
+          closedTabIds.has(tabId) ||
+          !tabContainers.has(tabId) ||
+          removingContainers.has(info.containerName)
+        ) {
+          return;
+        }
+        const stillAlive = await withStepTimeout(chrome.tabs.get(tabId), 1000, null);
+        if (!stillAlive || closedTabIds.has(tabId)) {
+          return;
+        }
+        if (stillAlive.groupId !== -1) {
+          info.groupId = stillAlive.groupId;
+          return;
+        }
         const oldContainerName = info.containerName;
         tabContainers.delete(tabId);
         await clearTabDnrSessionRules(tabId);
@@ -1865,6 +2019,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     }
   }
 
+  if (closedTabIds.has(tabId)) return;
   if (creatingTabCount > 0 && !tabContainers.has(tabId)) return;
   if (initializingTabs.has(tabId)) return;
 
@@ -1888,6 +2043,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener(async tabId => {
+  markTabClosed(tabId);
   initializingTabs.delete(tabId);
   attachedTabs.delete(tabId);
   attachingTabs.delete(tabId);
