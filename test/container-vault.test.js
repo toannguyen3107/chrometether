@@ -126,9 +126,11 @@ test('buildDnrSessionRulesForTab generates Set-Cookie stripper, Cookie setter, a
   );
 
   const rules = vault.buildDnrSessionRulesForTab('acc-1', 42);
-  // Every rule MUST specify excludedResourceTypes: [] so Chrome does not exclude main_frame by default!
+  // Every rule MUST explicitly include main_frame in resourceTypes so Chromium DNR applies it to top-level navigations!
   for (const r of rules) {
-    assert.deepEqual(r.condition.excludedResourceTypes, []);
+    assert.ok(Array.isArray(r.condition.resourceTypes));
+    assert.ok(r.condition.resourceTypes.includes('main_frame'));
+    assert.ok(r.condition.resourceTypes.includes('xmlhttprequest'));
   }
 
   // Rule 1: Set-Cookie removal on responses (B1 fix)
@@ -157,12 +159,55 @@ test('buildDnrSessionRulesForTab generates Set-Cookie stripper, Cookie setter, a
   assert.equal(blockedRules.length, 1);
   assert.equal(blockedRules[0].action.type, 'block');
   assert.deepEqual(blockedRules[0].condition.tabIds, [42]);
-  assert.deepEqual(blockedRules[0].condition.excludedResourceTypes, []);
+  assert.ok(blockedRules[0].condition.resourceTypes.includes('main_frame'));
+
+  // Large Chrome tabIds (e.g. 486,741,406) must map to valid signed 32-bit integer rule IDs (<= 2,147,483,647)
+  const highTabRules = vault.buildDnrSessionRulesForTab('acc-1', 486741406);
+  for (const r of highTabRules) {
+    assert.ok(Number.isInteger(r.id) && r.id > 0 && r.id <= 2147483647, `rule.id ${r.id} overflows int32`);
+  }
+
+  // Subdomain + parent-domain cookies must merge hierarchically with higher priority for more specific subdomains
+  vault.applySetCookieHeaders(
+    'acc-1',
+    ['sub_only=1; Path=/; Secure; HttpOnly'],
+    'https://www.example.com/app'
+  );
+  // Add a non-Secure cookie on www.example.com as well to verify Secure vs non-Secure rule splitting
+  vault.applySetCookieHeaders(
+    'acc-1',
+    ['theme_pref=compact; Path=/'],
+    'https://www.example.com/app'
+  );
+  const mergedRules = vault.buildDnrSessionRulesForTab('acc-1', 42);
+  const parentRule = mergedRules.find(
+    r => r.condition.requestDomains?.[0] === 'example.com' && r.condition.urlFilter === '|https*'
+  );
+  const subHttpsRule = mergedRules.find(
+    r => r.condition.requestDomains?.[0] === 'www.example.com' && r.condition.urlFilter === '|https*'
+  );
+  const subHttpRule = mergedRules.find(
+    r => r.condition.requestDomains?.[0] === 'www.example.com' && !r.condition.urlFilter
+  );
+  assert.ok(parentRule && subHttpsRule && subHttpRule);
+  assert.ok(subHttpsRule.priority > parentRule.priority);
+  assert.ok(subHttpsRule.priority > subHttpRule.priority);
+  assert.equal(subHttpsRule.action.requestHeaders[0].value, 'auth=token_acc1; sub_only=1; theme_pref=compact');
+  // Plain HTTP rule must NEVER leak Secure cookies (auth, sub_only)
+  assert.equal(subHttpRule.action.requestHeaders[0].value, 'theme_pref=compact');
 
   // Init script must capture and delete window.__chrometether_vault_sync from Main World
+  // and isolate IndexedDB, CacheStorage, BroadcastChannel, SharedWorker, WebLocks, OPFS, and ServiceWorker
   const initScript = vault.buildInitScript('acc-1');
   assert.ok(initScript.includes('delete window.__chrometether_vault_sync'));
   assert.ok(initScript.includes('const rawSyncBinding ='));
+  assert.ok(initScript.includes('IDBFactory.prototype.open'));
+  assert.ok(initScript.includes('CacheStorage.prototype.open'));
+  assert.ok(initScript.includes('ContainerBroadcastChannel'));
+  assert.ok(initScript.includes('ContainerSharedWorker'));
+  assert.ok(initScript.includes('LockManager.prototype.request'));
+  assert.ok(initScript.includes('StorageManager.prototype.getDirectory'));
+  assert.ok(initScript.includes('navigator.serviceWorker.getRegistrations'));
 });
 
 test('extractUrlContainerHint extracts #tether-container and strips it cleanly', () => {
