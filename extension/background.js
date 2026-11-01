@@ -263,12 +263,22 @@ function applySetCookiesToLocalVault(containerName, setCookieHeaders, requestUrl
       continue;
     }
     if (idx !== -1) {
-      parsed.createdAt = entry.cookies[idx].createdAt || now;
+      const prev = entry.cookies[idx];
+      parsed.createdAt = prev.createdAt || now;
       entry.cookies[idx] = parsed;
+      if (
+        prev.value !== parsed.value ||
+        Boolean(prev.secure) !== Boolean(parsed.secure) ||
+        Boolean(prev.httpOnly) !== Boolean(parsed.httpOnly) ||
+        prev.sameSite !== parsed.sameSite
+      ) {
+        changed = true;
+      }
     } else {
       entry.cookies.push(parsed);
+      if (entry.cookies.length > 300) entry.cookies.shift();
+      changed = true;
     }
-    changed = true;
   }
   return changed;
 }
@@ -1144,32 +1154,47 @@ async function deleteContainerLocal(
   }
 }
 
+let dnrUpdateChain = Promise.resolve();
+
 async function updateTabDnrSessionRules(tabId, newRules = []) {
   const numericTabId = Number(tabId);
   if (!Number.isInteger(numericTabId) || numericTabId <= 0) return;
+
+  const info = tabContainers.get(numericTabId);
+  const rulesJson = JSON.stringify(newRules);
+  if (newRules.length > 0 && info && info.appliedDnrRulesJson === rulesJson) {
+    return;
+  }
 
   const minId = getTabDnrBaseRuleId(numericTabId);
   const maxId = minId + 99;
   const newRuleIds = new Set(newRules.map(r => r.id));
 
-  try {
-    const existing = await chrome.declarativeNetRequest.getSessionRules();
-    const removeRuleIds = existing
-      .filter(
-        r =>
-          (r.id >= minId && r.id <= maxId) ||
-          newRuleIds.has(r.id) ||
-          (Array.isArray(r.condition?.tabIds) && r.condition.tabIds.includes(numericTabId))
-      )
-      .map(r => r.id);
+  const next = dnrUpdateChain.catch(() => {}).then(async () => {
+    try {
+      const existing = await chrome.declarativeNetRequest.getSessionRules();
+      const removeRuleIds = existing
+        .filter(
+          r =>
+            (r.id >= minId && r.id <= maxId) ||
+            newRuleIds.has(r.id) ||
+            (Array.isArray(r.condition?.tabIds) && r.condition.tabIds.includes(numericTabId))
+        )
+        .map(r => r.id);
 
-    await chrome.declarativeNetRequest.updateSessionRules({
-      removeRuleIds,
-      addRules: newRules
-    });
-  } catch (err) {
-    console.warn('DNR updateSessionRules error for tab', numericTabId, err);
-  }
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds,
+        addRules: newRules
+      });
+      if (info) {
+        info.appliedDnrRulesJson = newRules.length > 0 ? rulesJson : null;
+      }
+    } catch (err) {
+      console.warn('DNR updateSessionRules error for tab', numericTabId, err);
+    }
+  });
+  dnrUpdateChain = next;
+  return next;
 }
 
 async function clearTabDnrSessionRules(tabId) {
@@ -1184,6 +1209,13 @@ async function refreshTabInitScript(tabId, info, scriptSource = null) {
   if (scriptSource) {
     info.initScript = scriptSource;
   }
+  if (
+    info.initScript &&
+    info.appliedInitScript === info.initScript &&
+    info.initScriptId
+  ) {
+    return;
+  }
   const prev = refreshingInitScripts.get(numericTabId) || Promise.resolve();
   const next = prev
     .catch(() => {})
@@ -1196,6 +1228,9 @@ async function refreshTabInitScript(tabId, info, scriptSource = null) {
           ? buildInitScriptForLocalContainer(latestInfo.containerName)
           : '');
       if (!latestSource) return;
+      if (latestInfo.appliedInitScript === latestSource && latestInfo.initScriptId) {
+        return;
+      }
       const target = { tabId: numericTabId };
       if (latestInfo.initScriptId) {
         await chrome.debugger
@@ -1215,6 +1250,7 @@ async function refreshTabInitScript(tabId, info, scriptSource = null) {
         );
         if (res?.identifier) {
           latestInfo.initScriptId = res.identifier;
+          latestInfo.appliedInitScript = latestSource;
         }
       } catch {
         // ignore
@@ -1626,7 +1662,9 @@ async function handleHubRequest(msg) {
       if (cName && (Array.isArray(cookies) || (localStorage && typeof localStorage === 'object'))) {
         mergeHubContainerData(cName, { cookies, localStorage });
       }
-      await updateTabDnrSessionRules(numericTabId, Array.isArray(rules) ? rules : []);
+      if (Array.isArray(rules)) {
+        await updateTabDnrSessionRules(numericTabId, rules);
+      }
       if (initScript && tabContainers.has(numericTabId)) {
         const info = tabContainers.get(numericTabId);
         await refreshTabInitScript(numericTabId, info, initScript);
@@ -1712,18 +1750,20 @@ chrome.webRequest.onHeadersReceived.addListener(
         setCookies,
         details.url
       );
-      if (changed) {
-        persistVaultAndTabs();
-        syncAllTabsForContainer(containerInfo.containerName);
-        broadcastPopupState();
-      }
-      sendToHub({
+      const sentToHub = sendToHub({
         type: 'ext_set_cookie_captured',
         tabId: details.tabId,
         containerName: containerInfo.containerName,
         url: details.url,
         setCookieHeaders: setCookies
       });
+      if (changed) {
+        persistVaultAndTabs();
+        if (!sentToHub) {
+          syncAllTabsForContainer(containerInfo.containerName);
+        }
+        broadcastPopupState();
+      }
     }
   },
   { urls: ['<all_urls>'] },
