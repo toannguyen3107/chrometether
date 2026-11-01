@@ -417,15 +417,24 @@ export class ContainerVault {
       }
 
       if (existingIdx !== -1) {
-        parsed.createdAt = entry.cookies[existingIdx].createdAt || now;
+        const prev = entry.cookies[existingIdx];
+        parsed.createdAt = prev.createdAt || now;
         entry.cookies[existingIdx] = parsed;
+        if (
+          prev.value !== parsed.value ||
+          Boolean(prev.secure) !== Boolean(parsed.secure) ||
+          Boolean(prev.httpOnly) !== Boolean(parsed.httpOnly) ||
+          prev.sameSite !== parsed.sameSite
+        ) {
+          changed = true;
+        }
       } else {
         entry.cookies.push(parsed);
         if (entry.cookies.length > MAX_COOKIES_PER_CONTAINER) {
           entry.cookies.shift();
         }
+        changed = true;
       }
-      changed = true;
     }
 
     if (changed && this.autoSave) {

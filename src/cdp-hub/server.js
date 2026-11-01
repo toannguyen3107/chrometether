@@ -1010,19 +1010,37 @@ export class CdpHubServer {
   }
 
   async _syncContainerDnrRules(containerName) {
-    for (const tab of this.tabs.values()) {
-      if (tab.containerName === containerName) {
-        await this._syncTabDnrRules(tab);
-      }
+    if (!this._containerSyncInFlight) this._containerSyncInFlight = new Map();
+    if (!this._containerSyncDirty) this._containerSyncDirty = new Set();
+    if (this._containerSyncInFlight.has(containerName)) {
+      this._containerSyncDirty.add(containerName);
+      return this._containerSyncInFlight.get(containerName);
     }
+    const run = (async () => {
+      try {
+        do {
+          this._containerSyncDirty.delete(containerName);
+          for (const tab of this.tabs.values()) {
+            if (tab.containerName === containerName) {
+              await this._syncTabDnrRules(tab);
+            }
+          }
+        } while (this._containerSyncDirty.has(containerName));
+      } finally {
+        this._containerSyncInFlight.delete(containerName);
+      }
+    })();
+    this._containerSyncInFlight.set(containerName, run);
+    return run;
   }
 
-  async _syncTabDnrRules(tab, { failClosedBlocked = false } = {}) {
+  async _syncTabDnrRules(tab, { failClosedBlocked = false, force = false } = {}) {
     if (!tab.containerName) return;
     const initScript = this.vault.buildInitScript(tab.containerName, {
       sessionStorage: tab.sessionStorage || null
     });
-    if (this.directWs?.readyState === WS_STATE.OPEN && tab.upstreamTargetId) {
+    const initScriptChanged = force || tab._lastSentInitScript !== initScript;
+    if (this.directWs?.readyState === WS_STATE.OPEN && tab.upstreamTargetId && initScriptChanged) {
       if (tab._initScriptId) {
         await this._forwardTabCdpCommand(tab, 'Page.removeScriptToEvaluateOnNewDocument', {
           identifier: tab._initScriptId
@@ -1032,7 +1050,10 @@ export class CdpHubServer {
       const res = await this._forwardTabCdpCommand(tab, 'Page.addScriptToEvaluateOnNewDocument', {
         source: initScript
       }).catch(() => null);
-      if (res?.identifier) tab._initScriptId = res.identifier;
+      if (res?.identifier) {
+        tab._initScriptId = res.identifier;
+        tab._lastSentInitScript = initScript;
+      }
     }
     if (!this.extSocket || this.extSocket.readyState !== WS_STATE.OPEN) return;
     const numericTabId = Number(tab.tabId);
@@ -1041,24 +1062,33 @@ export class CdpHubServer {
     const rules = this.vault.buildDnrSessionRulesForTab(tab.containerName, numericTabId, {
       failClosedBlocked
     });
+    const rulesJson = JSON.stringify(rules);
+    const rulesChanged = force || tab._lastSentDnrRulesJson !== rulesJson;
+    if (!rulesChanged && !initScriptChanged) {
+      return;
+    }
+
     const entry = this.vault.getContainer(tab.containerName);
     const slotId = getTabDnrSlotId(numericTabId);
     try {
-      if (slotId > 0 && slotId !== numericTabId) {
+      if (rulesChanged && slotId > 0 && slotId !== numericTabId && !tab._slotClearedOnce) {
         // Ensure backward-compatibility if an unpatched Extension Service Worker is still loaded in Chrome memory
         await this._sendExtensionRequest('update_tab_dnr_rules', {
           tabId: slotId,
           rules: []
         }).catch(() => {});
+        tab._slotClearedOnce = true;
       }
       await this._sendExtensionRequest('update_tab_dnr_rules', {
         tabId: numericTabId,
         containerName: tab.containerName,
-        rules,
-        initScript,
+        rules: rulesChanged ? rules : undefined,
+        initScript: initScriptChanged ? initScript : undefined,
         cookies: entry ? entry.cookies : undefined,
         localStorage: entry ? entry.localStorage : undefined
       });
+      tab._lastSentDnrRulesJson = rulesJson;
+      if (initScriptChanged) tab._lastSentInitScript = initScript;
     } catch {
       // ignore if extension is reconnecting
     }
@@ -1279,7 +1309,7 @@ export class CdpHubServer {
         this._pendingCreateTabCount = Math.max(0, (this._pendingCreateTabCount || 1) - 1);
       }
       if (container) {
-        await this._syncTabDnrRules(tab);
+        await this._syncTabDnrRules(tab, { force: true });
         if (targetUrl && targetUrl !== 'about:blank') {
           await this._forwardTabCdpCommand(tab, 'Page.navigate', { url: targetUrl }).catch(() => {});
         }
@@ -1369,7 +1399,7 @@ export class CdpHubServer {
           tabId: Number(tab.tabId),
           method,
           params
-        });
+        }, 30000);
         tab._extAttachGate = p;
         try {
           const res = await p;
@@ -1383,7 +1413,7 @@ export class CdpHubServer {
         tabId: Number(tab.tabId),
         method,
         params
-      });
+      }, 30000);
     }
 
     if (this.directWs && this.directWs.readyState === WS_STATE.OPEN && tab.upstreamTargetId) {
