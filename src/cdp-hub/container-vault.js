@@ -29,6 +29,62 @@ export const COLOR_BADGES = {
 const MAX_COOKIES_PER_CONTAINER = 500;
 const MAX_STORAGE_KEYS_PER_ORIGIN = 1000;
 
+export const DNR_ALL_RESOURCE_TYPES = [
+  'main_frame',
+  'sub_frame',
+  'stylesheet',
+  'script',
+  'image',
+  'font',
+  'object',
+  'xmlhttprequest',
+  'ping',
+  'csp_report',
+  'media',
+  'websocket',
+  'webtransport',
+  'webbundle',
+  'other'
+];
+
+/**
+ * Compute a positive 32-bit signed integer base rule ID for Chrome DNR.
+ * Real Chrome tabIds can exceed 21,474,836 (e.g. 486,741,406), so multiplying
+ * directly by 100 overflows INT32_MAX (2,147,483,647) and causes DNR to reject rules.
+ */
+export function getTabDnrSlotId(tabId) {
+  const numericTabId = Number(tabId);
+  if (!Number.isInteger(numericTabId) || numericTabId <= 0) return 0;
+  return ((numericTabId - 1) % 19999999) + 1;
+}
+
+export function getTabDnrBaseRuleId(tabId) {
+  const slotId = getTabDnrSlotId(tabId);
+  return slotId > 0 ? slotId * 100 : 0;
+}
+
+export function toCdpCookie(c) {
+  const name = String(c.name || '');
+  const value = String(c.value || '');
+  const cleanDomain = String(c.domain || '').replace(/^\.+/, '');
+  return {
+    name,
+    value,
+    domain: c.hostOnly ? cleanDomain : `.${cleanDomain}`,
+    path: c.path || '/',
+    expires: c.expires === null || c.expires === undefined ? -1 : Math.floor(c.expires / 1000),
+    size: Buffer.byteLength(name + value, 'utf8'),
+    httpOnly: Boolean(c.httpOnly),
+    secure: Boolean(c.secure),
+    session: c.expires === null || c.expires === undefined,
+    sameSite: c.sameSite || 'Lax',
+    priority: 'Medium',
+    sameParty: false,
+    sourceScheme: c.secure ? 'Secure' : 'NonSecure',
+    sourcePort: c.secure ? 443 : 80
+  };
+}
+
 export function getDefaultContainersFilePath() {
   if (process.env.CHROMETETHER_CONTAINERS_FILE) {
     return path.resolve(process.env.CHROMETETHER_CONTAINERS_FILE);
@@ -424,6 +480,221 @@ export class ContainerVault {
     return cookies.map(c => `${c.name}=${c.value}`).join('; ');
   }
 
+  exportContainersSnapshot() {
+    return this.listContainers().map(info => {
+      const entry = this.containers.get(info.name);
+      return {
+        ...info,
+        cookies: entry ? [...entry.cookies] : [],
+        localStorage: entry ? { ...entry.localStorage } : {}
+      };
+    });
+  }
+
+  mergeContainerData(rawName, { color, createdAt, cookies, localStorage } = {}) {
+    const entry = this.ensureContainer(rawName, { color });
+    let changed = false;
+    if (createdAt && (!entry.createdAt || createdAt < entry.createdAt)) {
+      entry.createdAt = createdAt;
+    }
+    const now = Date.now();
+    if (Array.isArray(cookies)) {
+      for (const c of cookies) {
+        if (!c?.name || !c?.domain) continue;
+        if (c.expires !== null && c.expires !== undefined && c.expires <= now) continue;
+        const idx = entry.cookies.findIndex(
+          existing =>
+            existing.name === c.name &&
+            existing.domain === c.domain &&
+            existing.path === (c.path || '/') &&
+            Boolean(existing.hostOnly) === Boolean(c.hostOnly)
+        );
+        if (idx === -1) {
+          entry.cookies.push({
+            name: String(c.name),
+            value: String(c.value ?? ''),
+            domain: String(c.domain).toLowerCase().replace(/^\.+/, ''),
+            hostOnly: Boolean(c.hostOnly),
+            path: c.path || '/',
+            secure: Boolean(c.secure),
+            httpOnly: Boolean(c.httpOnly),
+            sameSite: c.sameSite || 'Lax',
+            expires: c.expires ?? null,
+            createdAt: c.createdAt || now
+          });
+          changed = true;
+        } else if (entry.cookies[idx].value !== String(c.value ?? '')) {
+          entry.cookies[idx] = {
+            ...entry.cookies[idx],
+            value: String(c.value ?? ''),
+            secure: Boolean(c.secure),
+            httpOnly: Boolean(c.httpOnly),
+            sameSite: c.sameSite || 'Lax',
+            expires: c.expires ?? null
+          };
+          changed = true;
+        }
+      }
+    }
+    if (localStorage && typeof localStorage === 'object') {
+      for (const [origin, bucket] of Object.entries(localStorage)) {
+        if (bucket && typeof bucket === 'object') {
+          entry.localStorage[origin] = {
+            ...(entry.localStorage[origin] || {}),
+            ...bucket
+          };
+          changed = true;
+        }
+      }
+    }
+    if (changed && this.autoSave) {
+      this.save();
+    }
+    return changed;
+  }
+
+  getCdpCookies(rawName, urls = null) {
+    const entry = this.getContainer(rawName);
+    if (!entry) return [];
+    const now = Date.now();
+    entry.cookies = entry.cookies.filter(c => c.expires === null || c.expires > now);
+
+    if (Array.isArray(urls) && urls.length > 0) {
+      const seen = new Set();
+      const result = [];
+      for (const u of urls) {
+        for (const c of this.getCookiesForUrl(rawName, u, { includeHttpOnly: true })) {
+          const key = `${c.name}\0${c.domain}\0${c.path}\0${Boolean(c.hostOnly)}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            result.push(toCdpCookie(c));
+          }
+        }
+      }
+      return result;
+    }
+
+    return entry.cookies.map(toCdpCookie);
+  }
+
+  setCdpCookie(rawName, param = {}) {
+    if (!param || typeof param.name !== 'string' || !param.name.trim()) {
+      return false;
+    }
+    const name = param.name.trim();
+    const value = String(param.value ?? '');
+    let parsedUrl = null;
+    if (param.url) {
+      try {
+        parsedUrl = new URL(param.url);
+      } catch {
+        parsedUrl = null;
+      }
+    }
+    const reqHost = parsedUrl ? parsedUrl.hostname.toLowerCase() : '';
+    let domain = '';
+    let hostOnly = true;
+    if (param.domain) {
+      domain = String(param.domain).toLowerCase().replace(/^\.+/, '');
+      hostOnly = false;
+      if (reqHost && !domainMatches(reqHost, domain, false)) {
+        return false;
+      }
+    } else if (reqHost) {
+      domain = reqHost;
+      hostOnly = true;
+    } else {
+      return false;
+    }
+
+    const cookiePath = param.path && String(param.path).startsWith('/')
+      ? String(param.path)
+      : parsedUrl
+        ? computeDefaultCookiePath(parsedUrl.pathname)
+        : '/';
+    const isHttps = parsedUrl
+      ? parsedUrl.protocol === 'https:' || parsedUrl.protocol === 'wss:'
+      : Boolean(param.secure);
+    const secure = Boolean(param.secure) || (parsedUrl ? parsedUrl.protocol === 'https:' && name.startsWith('__') : false);
+    if (name.startsWith('__Secure-') && (!secure || !isHttps)) {
+      return false;
+    }
+    if (name.startsWith('__Host-') && (!secure || !isHttps || !hostOnly || cookiePath !== '/')) {
+      return false;
+    }
+
+    let expires = null;
+    if (typeof param.expires === 'number' && param.expires !== -1) {
+      expires = param.expires > 1e11 ? Math.floor(param.expires) : Math.floor(param.expires * 1000);
+    }
+
+    const entry = this.ensureContainer(rawName);
+    const now = Date.now();
+    const existingIdx = entry.cookies.findIndex(
+      c =>
+        c.name === name &&
+        c.domain === domain &&
+        c.path === cookiePath &&
+        Boolean(c.hostOnly) === Boolean(hostOnly)
+    );
+
+    if (expires !== null && expires <= now) {
+      if (existingIdx !== -1) {
+        entry.cookies.splice(existingIdx, 1);
+        if (this.autoSave) this.save();
+      }
+      return true;
+    }
+
+    const record = {
+      name,
+      value,
+      domain,
+      hostOnly,
+      path: cookiePath,
+      secure: Boolean(param.secure),
+      httpOnly: Boolean(param.httpOnly),
+      sameSite: param.sameSite || 'Lax',
+      expires,
+      createdAt: existingIdx !== -1 ? entry.cookies[existingIdx].createdAt || now : now
+    };
+    if (existingIdx !== -1) {
+      entry.cookies[existingIdx] = record;
+    } else {
+      entry.cookies.push(record);
+      if (entry.cookies.length > MAX_COOKIES_PER_CONTAINER) {
+        entry.cookies.shift();
+      }
+    }
+    if (this.autoSave) this.save();
+    return true;
+  }
+
+  deleteCdpCookies(rawName, { name, url, domain, path: cookiePath } = {}) {
+    const entry = this.getContainer(rawName);
+    if (!entry || !name) return false;
+    let urlHost = '';
+    if (url) {
+      try {
+        urlHost = new URL(url).hostname.toLowerCase();
+      } catch {
+        urlHost = '';
+      }
+    }
+    const cleanDomain = domain ? String(domain).toLowerCase().replace(/^\.+/, '') : '';
+    const before = entry.cookies.length;
+    entry.cookies = entry.cookies.filter(c => {
+      if (c.name !== name) return true;
+      if (cleanDomain && c.domain !== cleanDomain) return true;
+      if (!cleanDomain && urlHost && !domainMatches(urlHost, c.domain, c.hostOnly)) return true;
+      if (cookiePath && c.path !== cookiePath) return true;
+      return false;
+    });
+    const changed = entry.cookies.length !== before;
+    if (changed && this.autoSave) this.save();
+    return changed;
+  }
+
   setStorageItem(rawName, origin, key, value, { session = false } = {}) {
     const entry = this.ensureContainer(rawName);
     const store = session ? entry.sessionStorage : entry.localStorage;
@@ -487,7 +758,7 @@ export class ContainerVault {
       return [];
     }
 
-    const baseRuleId = numericTabId * 100;
+    const baseRuleId = getTabDnrBaseRuleId(numericTabId);
     const rules = [];
 
     if (failClosedBlocked) {
@@ -498,7 +769,7 @@ export class ContainerVault {
         condition: {
           tabIds: [numericTabId],
           urlFilter: '*',
-          excludedResourceTypes: []
+          resourceTypes: [...DNR_ALL_RESOURCE_TYPES]
         }
       });
       return rules;
@@ -506,7 +777,7 @@ export class ContainerVault {
 
     // Rule 1: Always strip `Set-Cookie` from responses on this container tab so Chrome's
     // default cookie jar is never polluted (Fixes B1).
-    // Note: `excludedResourceTypes: []` is mandatory in Chrome DNR so `main_frame` is included!
+    // Note: Explicit `resourceTypes` including `main_frame` is required in Chromium DNR!
     rules.push({
       id: baseRuleId + 1,
       priority: 100,
@@ -516,7 +787,7 @@ export class ContainerVault {
       },
       condition: {
         tabIds: [numericTabId],
-        excludedResourceTypes: []
+        resourceTypes: [...DNR_ALL_RESOURCE_TYPES]
       }
     });
 
@@ -531,7 +802,7 @@ export class ContainerVault {
       },
       condition: {
         tabIds: [numericTabId],
-        excludedResourceTypes: []
+        resourceTypes: [...DNR_ALL_RESOURCE_TYPES]
       }
     });
 
@@ -541,52 +812,90 @@ export class ContainerVault {
     const now = Date.now();
     const validCookies = entry.cookies.filter(c => c.expires === null || c.expires > now);
 
-    // Group cookies by domain
-    const byDomain = new Map();
-    for (const c of validCookies) {
-      const dom = c.domain;
-      if (!byDomain.has(dom)) {
-        byDomain.set(dom, []);
-      }
-      byDomain.get(dom).push(c);
-    }
+    // Collect unique cookie domains and include parent-domain cookies for subdomains
+    // so subdomain rules (e.g. www.expedia.com) include parent cookies (e.g. expedia.com)
+    // and win via higher priority over the parent domain rule.
+    const uniqueDomains = [...new Set(validCookies.map(c => c.domain).filter(Boolean))];
 
     let offset = 3;
-    for (const [domain, domainCookies] of byDomain.entries()) {
-      if (offset >= 99) break;
+    for (const domain of uniqueDomains) {
+      if (offset >= 98) break;
+      const domainCookies = validCookies.filter(c => domainMatches(domain, c.domain, c.hostOnly));
+      if (domainCookies.length === 0) continue;
+
       domainCookies.sort((a, b) => b.path.length - a.path.length || (a.createdAt || 0) - (b.createdAt || 0));
-      const cookieHeaderValue = domainCookies.map(c => `${c.name}=${c.value}`).join('; ');
-      const allSecure = domainCookies.every(c => c.secure);
-      const strictOrLax = domainCookies.every(c => c.sameSite === 'Strict' || c.sameSite === 'Lax');
+      const specificity = Math.min(40, domain.split('.').length);
+      const hasSecure = domainCookies.some(c => c.secure);
+      const httpCookies = domainCookies.filter(c => !c.secure);
 
-      const condition = {
-        tabIds: [numericTabId],
-        requestDomains: [domain],
-        excludedResourceTypes: []
-      };
-      if (allSecure) {
-        condition.urlFilter = '|https*';
-      }
-      if (strictOrLax) {
-        condition.domainType = 'firstParty';
-      }
+      if (hasSecure) {
+        // Higher-priority HTTPS rule includes both Secure and non-Secure cookies.
+        // Per official Chrome DNR evaluation order, a higher-priority 'set' rule prevents
+        // any lower-priority 'set' rule from modifying the Cookie header on HTTPS requests.
+        rules.push({
+          id: baseRuleId + offset++,
+          priority: 250 + specificity,
+          action: {
+            type: 'modifyHeaders',
+            requestHeaders: [
+              {
+                header: 'cookie',
+                operation: 'set',
+                value: domainCookies.map(c => `${c.name}=${c.value}`).join('; ')
+              }
+            ]
+          },
+          condition: {
+            tabIds: [numericTabId],
+            requestDomains: [domain],
+            urlFilter: '|https*',
+            resourceTypes: [...DNR_ALL_RESOURCE_TYPES]
+          }
+        });
 
-      rules.push({
-        id: baseRuleId + offset,
-        priority: 200,
-        action: {
-          type: 'modifyHeaders',
-          requestHeaders: [
-            {
-              header: 'cookie',
-              operation: 'set',
-              value: cookieHeaderValue
+        // Lower-priority fallback rule for plain HTTP requests includes ONLY non-Secure cookies
+        if (httpCookies.length > 0 && offset < 99) {
+          rules.push({
+            id: baseRuleId + offset++,
+            priority: 200 + specificity,
+            action: {
+              type: 'modifyHeaders',
+              requestHeaders: [
+                {
+                  header: 'cookie',
+                  operation: 'set',
+                  value: httpCookies.map(c => `${c.name}=${c.value}`).join('; ')
+                }
+              ]
+            },
+            condition: {
+              tabIds: [numericTabId],
+              requestDomains: [domain],
+              resourceTypes: [...DNR_ALL_RESOURCE_TYPES]
             }
-          ]
-        },
-        condition
-      });
-      offset += 1;
+          });
+        }
+      } else {
+        rules.push({
+          id: baseRuleId + offset++,
+          priority: 200 + specificity,
+          action: {
+            type: 'modifyHeaders',
+            requestHeaders: [
+              {
+                header: 'cookie',
+                operation: 'set',
+                value: domainCookies.map(c => `${c.name}=${c.value}`).join('; ')
+              }
+            ]
+          },
+          condition: {
+            tabIds: [numericTabId],
+            requestDomains: [domain],
+            resourceTypes: [...DNR_ALL_RESOURCE_TYPES]
+          }
+        });
+      }
     }
 
     return rules;
@@ -832,7 +1141,9 @@ export class ContainerVault {
         b[key] = val;
         notifyHub({ type: 'storageSet', session: isSession, origin: location.origin, key, value: val });
         try {
-          window.dispatchEvent(new StorageEvent('storage', { key, oldValue: oldVal, newValue: val, url: location.href }));
+          const sev = new StorageEvent('storage', { key, oldValue: oldVal, newValue: val, url: location.href });
+          Object.defineProperty(sev, '__chrometetherSynthetic', { value: true });
+          window.dispatchEvent(sev);
         } catch {}
       },
       removeItem(k) {
@@ -887,9 +1198,210 @@ export class ContainerVault {
   } catch {}
 
   // Prevent site Service Workers from bypassing tab-scoped container isolation (Fable H4)
+  // and isolate IndexedDB, CacheStorage, BroadcastChannel, SharedWorker, WebLocks, OPFS, and StorageEvents per container.
+  const nsPrefix = '__ct_' + state.container + '__';
+  const toNs = (name) => nsPrefix + String(name ?? '');
+  const fromNs = (name) => {
+    const s = String(name ?? '');
+    return s.startsWith(nsPrefix) ? s.slice(nsPrefix.length) : null;
+  };
+
+  try {
+    window.addEventListener('storage', (ev) => {
+      if (ev && !ev.__chrometetherSynthetic) {
+        ev.stopImmediatePropagation();
+      }
+    }, true);
+  } catch {}
+
+  try {
+    if (typeof IDBFactory !== 'undefined' && IDBFactory.prototype) {
+      const origOpen = IDBFactory.prototype.open;
+      const origDelete = IDBFactory.prototype.deleteDatabase;
+      const origDatabases = IDBFactory.prototype.databases;
+      if (typeof origOpen === 'function') {
+        IDBFactory.prototype.open = function(name, version) {
+          return arguments.length > 1
+            ? origOpen.call(this, toNs(name), version)
+            : origOpen.call(this, toNs(name));
+        };
+      }
+      if (typeof origDelete === 'function') {
+        IDBFactory.prototype.deleteDatabase = function(name) {
+          return origDelete.call(this, toNs(name));
+        };
+      }
+      if (typeof origDatabases === 'function') {
+        IDBFactory.prototype.databases = async function() {
+          const list = await origDatabases.call(this);
+          if (!Array.isArray(list)) return [];
+          const out = [];
+          for (const item of list) {
+            const unprefixed = item && item.name ? fromNs(item.name) : null;
+            if (unprefixed !== null) out.push({ ...item, name: unprefixed });
+          }
+          return out;
+        };
+      }
+    }
+    if (typeof IDBDatabase !== 'undefined' && IDBDatabase.prototype) {
+      const nameDesc = Object.getOwnPropertyDescriptor(IDBDatabase.prototype, 'name');
+      if (nameDesc && typeof nameDesc.get === 'function') {
+        Object.defineProperty(IDBDatabase.prototype, 'name', {
+          ...nameDesc,
+          get() {
+            const raw = nameDesc.get.call(this);
+            const stripped = fromNs(raw);
+            return stripped !== null ? stripped : raw;
+          }
+        });
+      }
+    }
+  } catch {}
+
+  try {
+    if (typeof CacheStorage !== 'undefined' && CacheStorage.prototype) {
+      const origOpen = CacheStorage.prototype.open;
+      const origHas = CacheStorage.prototype.has;
+      const origDelete = CacheStorage.prototype.delete;
+      const origKeys = CacheStorage.prototype.keys;
+      const origMatch = CacheStorage.prototype.match;
+      if (typeof origOpen === 'function') {
+        CacheStorage.prototype.open = function(cacheName) {
+          return origOpen.call(this, toNs(cacheName));
+        };
+      }
+      if (typeof origHas === 'function') {
+        CacheStorage.prototype.has = function(cacheName) {
+          return origHas.call(this, toNs(cacheName));
+        };
+      }
+      if (typeof origDelete === 'function') {
+        CacheStorage.prototype.delete = function(cacheName) {
+          return origDelete.call(this, toNs(cacheName));
+        };
+      }
+      if (typeof origKeys === 'function') {
+        CacheStorage.prototype.keys = async function() {
+          const allKeys = await origKeys.call(this);
+          if (!Array.isArray(allKeys)) return [];
+          const out = [];
+          for (const k of allKeys) {
+            const unprefixed = fromNs(k);
+            if (unprefixed !== null) out.push(unprefixed);
+          }
+          return out;
+        };
+      }
+      if (typeof origMatch === 'function' && typeof origKeys === 'function' && typeof origOpen === 'function') {
+        CacheStorage.prototype.match = async function(request, options) {
+          if (options && options.cacheName) {
+            return origMatch.call(this, request, { ...options, cacheName: toNs(options.cacheName) });
+          }
+          const allKeys = await origKeys.call(this);
+          if (!Array.isArray(allKeys)) return undefined;
+          for (const rawKey of allKeys) {
+            if (fromNs(rawKey) !== null) {
+              const cache = await origOpen.call(this, rawKey);
+              const found = await cache.match(request, options);
+              if (found) return found;
+            }
+          }
+          return undefined;
+        };
+      }
+    }
+  } catch {}
+
+  try {
+    if (typeof BroadcastChannel === 'function') {
+      const OrigBroadcastChannel = BroadcastChannel;
+      const nameDesc = Object.getOwnPropertyDescriptor(OrigBroadcastChannel.prototype, 'name');
+      class ContainerBroadcastChannel extends OrigBroadcastChannel {
+        constructor(channelName) {
+          super(toNs(channelName));
+        }
+        get name() {
+          const raw = nameDesc && nameDesc.get ? nameDesc.get.call(this) : '';
+          const stripped = fromNs(raw);
+          return stripped !== null ? stripped : raw;
+        }
+      }
+      Object.defineProperty(window, 'BroadcastChannel', {
+        value: ContainerBroadcastChannel,
+        configurable: true,
+        writable: true
+      });
+    }
+  } catch {}
+
+  try {
+    if (typeof SharedWorker === 'function') {
+      const OrigSharedWorker = SharedWorker;
+      class ContainerSharedWorker extends OrigSharedWorker {
+        constructor(scriptURL, options) {
+          if (typeof options === 'string') {
+            super(scriptURL, toNs(options));
+          } else if (options && typeof options === 'object') {
+            super(scriptURL, { ...options, name: toNs(options.name || 'default') });
+          } else {
+            super(scriptURL, toNs('default'));
+          }
+        }
+      }
+      Object.defineProperty(window, 'SharedWorker', {
+        value: ContainerSharedWorker,
+        configurable: true,
+        writable: true
+      });
+    }
+  } catch {}
+
+  try {
+    if (typeof LockManager !== 'undefined' && LockManager.prototype) {
+      const origRequest = LockManager.prototype.request;
+      const origQuery = LockManager.prototype.query;
+      if (typeof origRequest === 'function') {
+        LockManager.prototype.request = function(name, ...rest) {
+          return origRequest.call(this, toNs(name), ...rest);
+        };
+      }
+      if (typeof origQuery === 'function') {
+        LockManager.prototype.query = async function() {
+          const snap = await origQuery.call(this);
+          if (!snap || typeof snap !== 'object') return snap;
+          const mapLocks = (arr) => Array.isArray(arr)
+            ? arr.filter(l => l && fromNs(l.name) !== null).map(l => ({ ...l, name: fromNs(l.name) }))
+            : [];
+          return {
+            held: mapLocks(snap.held),
+            pending: mapLocks(snap.pending)
+          };
+        };
+      }
+    }
+  } catch {}
+
+  try {
+    if (typeof StorageManager !== 'undefined' && StorageManager.prototype && typeof StorageManager.prototype.getDirectory === 'function') {
+      const origGetDir = StorageManager.prototype.getDirectory;
+      StorageManager.prototype.getDirectory = async function() {
+        const root = await origGetDir.call(this);
+        return root.getDirectoryHandle(nsPrefix.slice(0, -2), { create: true });
+      };
+    }
+  } catch {}
+
   try {
     if (navigator.serviceWorker) {
-      navigator.serviceWorker.register = () => Promise.reject(new DOMException('ServiceWorker disabled in ChromeTether Container Tab', 'SecurityError'));
+      const swErr = () => Promise.reject(new DOMException('ServiceWorker disabled in ChromeTether Container Tab', 'SecurityError'));
+      navigator.serviceWorker.register = swErr;
+      navigator.serviceWorker.getRegistration = () => Promise.resolve(undefined);
+      navigator.serviceWorker.getRegistrations = () => Promise.resolve([]);
+      try {
+        Object.defineProperty(navigator.serviceWorker, 'controller', { get: () => null, configurable: true });
+        Object.defineProperty(navigator.serviceWorker, 'ready', { get: () => new Promise(() => {}), configurable: true });
+      } catch {}
     }
   } catch {}
 })();`;

@@ -144,6 +144,7 @@ export async function handleContainerToolCall(name, args = {}) {
       await ensureHubDaemon({ waitTimeoutMs: 3000 });
       const res = await hubHttpRequest('/containers/open-tab', {
         method: 'POST',
+        timeoutMs: 15000,
         body: {
           container: containerName,
           url: args.url,
@@ -170,6 +171,7 @@ export async function handleContainerToolCall(name, args = {}) {
         await ensureHubDaemon({ waitTimeoutMs: 2000 });
         const res = await hubHttpRequest('/containers/clear', {
           method: 'POST',
+          timeoutMs: 10000,
           body: { name: containerName, deleteContainer: Boolean(args.deleteContainer) }
         });
         if (res.statusCode === 200 && res.data?.ok) {
@@ -190,6 +192,7 @@ export async function handleContainerToolCall(name, args = {}) {
         await ensureHubDaemon({ waitTimeoutMs: 2000 });
         const res = await hubHttpRequest('/containers/delete', {
           method: 'POST',
+          timeoutMs: 10000,
           body: {
             name: containerName,
             closeTabs: args.closeTabs !== false

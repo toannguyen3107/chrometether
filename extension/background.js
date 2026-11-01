@@ -139,6 +139,14 @@ function parseSetCookieHeaderLocal(setCookieStr, requestUrl) {
     }
   }
 
+  const isHttps = parsedUrl.protocol === 'https:' || parsedUrl.protocol === 'wss:';
+  if (name.startsWith('__Secure-') && (!secure || !isHttps)) {
+    return null;
+  }
+  if (name.startsWith('__Host-') && (!secure || !isHttps || !hostOnly || path !== '/')) {
+    return null;
+  }
+
   return {
     name,
     value,
@@ -172,6 +180,61 @@ function ensureContainerInLocalVault(rawName, color = 'blue') {
   } else if (color && COLOR_BADGES[color] && entry.color !== color) {
     entry.color = color;
     entry.badge = COLOR_BADGES[color];
+  }
+  return entry;
+}
+
+function mergeHubContainerData(rawName, { color, createdAt, cookies, localStorage } = {}) {
+  const entry = ensureContainerInLocalVault(rawName, color);
+  if (createdAt && (!entry.createdAt || createdAt < entry.createdAt)) {
+    entry.createdAt = createdAt;
+  }
+  const now = Date.now();
+  if (Array.isArray(cookies)) {
+    for (const c of cookies) {
+      if (!c?.name || !c?.domain) continue;
+      if (c.expires !== null && c.expires !== undefined && c.expires <= now) continue;
+      const idx = entry.cookies.findIndex(
+        existing =>
+          existing.name === c.name &&
+          existing.domain === c.domain &&
+          existing.path === (c.path || '/') &&
+          Boolean(existing.hostOnly) === Boolean(c.hostOnly)
+      );
+      if (idx === -1) {
+        entry.cookies.push({
+          name: String(c.name),
+          value: String(c.value ?? ''),
+          domain: String(c.domain).toLowerCase().replace(/^\.+/, ''),
+          hostOnly: Boolean(c.hostOnly),
+          path: c.path || '/',
+          secure: Boolean(c.secure),
+          httpOnly: Boolean(c.httpOnly),
+          sameSite: c.sameSite || 'Lax',
+          expires: c.expires ?? null,
+          createdAt: c.createdAt || now
+        });
+      } else {
+        entry.cookies[idx] = {
+          ...entry.cookies[idx],
+          value: String(c.value ?? ''),
+          secure: Boolean(c.secure),
+          httpOnly: Boolean(c.httpOnly),
+          sameSite: c.sameSite || 'Lax',
+          expires: c.expires ?? null
+        };
+      }
+    }
+  }
+  if (localStorage && typeof localStorage === 'object') {
+    for (const [origin, bucket] of Object.entries(localStorage)) {
+      if (bucket && typeof bucket === 'object') {
+        entry.localStorage[origin] = {
+          ...(entry.localStorage[origin] || {}),
+          ...bucket
+        };
+      }
+    }
   }
   return entry;
 }
@@ -210,10 +273,43 @@ function applySetCookiesToLocalVault(containerName, setCookieHeaders, requestUrl
   return changed;
 }
 
+const DNR_ALL_RESOURCE_TYPES = [
+  'main_frame',
+  'sub_frame',
+  'stylesheet',
+  'script',
+  'image',
+  'font',
+  'object',
+  'xmlhttprequest',
+  'ping',
+  'csp_report',
+  'media',
+  'websocket',
+  'webtransport',
+  'webbundle',
+  'other'
+];
+
+function getTabDnrBaseRuleId(tabId) {
+  const numericTabId = Number(tabId);
+  if (!Number.isInteger(numericTabId) || numericTabId <= 0) return 0;
+  return (((numericTabId - 1) % 19999999) + 1) * 100;
+}
+
+function domainMatchesCookie(host, cookieDomain, hostOnly = false) {
+  const h = String(host || '').toLowerCase();
+  const d = String(cookieDomain || '').toLowerCase().replace(/^\.+/, '');
+  if (!h || !d) return false;
+  if (h === d) return true;
+  if (hostOnly) return false;
+  return h.endsWith(`.${d}`);
+}
+
 function buildDnrRulesForLocalContainerTab(containerName, tabId, { failClosedBlocked = false } = {}) {
   const numericTabId = Number(tabId);
   if (!Number.isInteger(numericTabId) || numericTabId <= 0) return [];
-  const baseRuleId = numericTabId * 100;
+  const baseRuleId = getTabDnrBaseRuleId(numericTabId);
 
   if (failClosedBlocked) {
     return [
@@ -221,7 +317,7 @@ function buildDnrRulesForLocalContainerTab(containerName, tabId, { failClosedBlo
         id: baseRuleId,
         priority: 1000,
         action: { type: 'block' },
-        condition: { tabIds: [numericTabId], urlFilter: '*', excludedResourceTypes: [] }
+        condition: { tabIds: [numericTabId], urlFilter: '*', resourceTypes: [...DNR_ALL_RESOURCE_TYPES] }
       }
     ];
   }
@@ -234,7 +330,7 @@ function buildDnrRulesForLocalContainerTab(containerName, tabId, { failClosedBlo
         type: 'modifyHeaders',
         responseHeaders: [{ header: 'set-cookie', operation: 'remove' }]
       },
-      condition: { tabIds: [numericTabId], excludedResourceTypes: [] }
+      condition: { tabIds: [numericTabId], resourceTypes: [...DNR_ALL_RESOURCE_TYPES] }
     },
     {
       id: baseRuleId + 2,
@@ -243,7 +339,7 @@ function buildDnrRulesForLocalContainerTab(containerName, tabId, { failClosedBlo
         type: 'modifyHeaders',
         requestHeaders: [{ header: 'cookie', operation: 'remove' }]
       },
-      condition: { tabIds: [numericTabId], excludedResourceTypes: [] }
+      condition: { tabIds: [numericTabId], resourceTypes: [...DNR_ALL_RESOURCE_TYPES] }
     }
   ];
 
@@ -253,37 +349,87 @@ function buildDnrRulesForLocalContainerTab(containerName, tabId, { failClosedBlo
   const now = Date.now();
   entry.cookies = entry.cookies.filter(c => c.expires === null || c.expires > now);
 
-  const byDomain = new Map();
-  for (const c of entry.cookies) {
-    if (!byDomain.has(c.domain)) byDomain.set(c.domain, []);
-    byDomain.get(c.domain).push(c);
-  }
+  const uniqueDomains = [...new Set(entry.cookies.map(c => c.domain).filter(Boolean))];
 
   let offset = 3;
-  for (const [domain, domainCookies] of byDomain.entries()) {
-    if (offset >= 99) break;
+  for (const domain of uniqueDomains) {
+    if (offset >= 98) break;
+    const domainCookies = entry.cookies.filter(c =>
+      domainMatchesCookie(domain, c.domain, c.hostOnly)
+    );
+    if (domainCookies.length === 0) continue;
+
     domainCookies.sort(
       (a, b) => b.path.length - a.path.length || (a.createdAt || 0) - (b.createdAt || 0)
     );
-    const cookieHeaderValue = domainCookies.map(c => `${c.name}=${c.value}`).join('; ');
-    const allSecure = domainCookies.every(c => c.secure);
-    const condition = {
-      tabIds: [numericTabId],
-      requestDomains: [domain],
-      excludedResourceTypes: []
-    };
-    if (allSecure) condition.urlFilter = '|https*';
+    const specificity = Math.min(40, domain.split('.').length);
+    const hasSecure = domainCookies.some(c => c.secure);
+    const httpCookies = domainCookies.filter(c => !c.secure);
 
-    rules.push({
-      id: baseRuleId + offset,
-      priority: 200,
-      action: {
-        type: 'modifyHeaders',
-        requestHeaders: [{ header: 'cookie', operation: 'set', value: cookieHeaderValue }]
-      },
-      condition
-    });
-    offset += 1;
+    if (hasSecure) {
+      rules.push({
+        id: baseRuleId + offset++,
+        priority: 250 + specificity,
+        action: {
+          type: 'modifyHeaders',
+          requestHeaders: [
+            {
+              header: 'cookie',
+              operation: 'set',
+              value: domainCookies.map(c => `${c.name}=${c.value}`).join('; ')
+            }
+          ]
+        },
+        condition: {
+          tabIds: [numericTabId],
+          requestDomains: [domain],
+          urlFilter: '|https*',
+          resourceTypes: [...DNR_ALL_RESOURCE_TYPES]
+        }
+      });
+
+      if (httpCookies.length > 0 && offset < 99) {
+        rules.push({
+          id: baseRuleId + offset++,
+          priority: 200 + specificity,
+          action: {
+            type: 'modifyHeaders',
+            requestHeaders: [
+              {
+                header: 'cookie',
+                operation: 'set',
+                value: httpCookies.map(c => `${c.name}=${c.value}`).join('; ')
+              }
+            ]
+          },
+          condition: {
+            tabIds: [numericTabId],
+            requestDomains: [domain],
+            resourceTypes: [...DNR_ALL_RESOURCE_TYPES]
+          }
+        });
+      }
+    } else {
+      rules.push({
+        id: baseRuleId + offset++,
+        priority: 200 + specificity,
+        action: {
+          type: 'modifyHeaders',
+          requestHeaders: [
+            {
+              header: 'cookie',
+              operation: 'set',
+              value: domainCookies.map(c => `${c.name}=${c.value}`).join('; ')
+            }
+          ]
+        },
+        condition: {
+          tabIds: [numericTabId],
+          requestDomains: [domain],
+          resourceTypes: [...DNR_ALL_RESOURCE_TYPES]
+        }
+      });
+    }
   }
 
   return rules;
@@ -479,9 +625,211 @@ function buildInitScriptForLocalContainer(containerName, customSessionStorage = 
     Object.defineProperty(window, 'localStorage', { value: makeStorage(state.localStorage, false), configurable: true });
     Object.defineProperty(window, 'sessionStorage', { value: makeStorage(state.sessionStorage, true), configurable: true });
   } catch {}
+  // Prevent site Service Workers from bypassing tab-scoped container isolation (Fable H4)
+  // and isolate IndexedDB, CacheStorage, BroadcastChannel, SharedWorker, WebLocks, OPFS, and StorageEvents per container.
+  const nsPrefix = '__ct_' + state.container + '__';
+  const toNs = (name) => nsPrefix + String(name ?? '');
+  const fromNs = (name) => {
+    const s = String(name ?? '');
+    return s.startsWith(nsPrefix) ? s.slice(nsPrefix.length) : null;
+  };
+
+  try {
+    window.addEventListener('storage', (ev) => {
+      if (ev && !ev.__chrometetherSynthetic) {
+        ev.stopImmediatePropagation();
+      }
+    }, true);
+  } catch {}
+
+  try {
+    if (typeof IDBFactory !== 'undefined' && IDBFactory.prototype) {
+      const origOpen = IDBFactory.prototype.open;
+      const origDelete = IDBFactory.prototype.deleteDatabase;
+      const origDatabases = IDBFactory.prototype.databases;
+      if (typeof origOpen === 'function') {
+        IDBFactory.prototype.open = function(name, version) {
+          return arguments.length > 1
+            ? origOpen.call(this, toNs(name), version)
+            : origOpen.call(this, toNs(name));
+        };
+      }
+      if (typeof origDelete === 'function') {
+        IDBFactory.prototype.deleteDatabase = function(name) {
+          return origDelete.call(this, toNs(name));
+        };
+      }
+      if (typeof origDatabases === 'function') {
+        IDBFactory.prototype.databases = async function() {
+          const list = await origDatabases.call(this);
+          if (!Array.isArray(list)) return [];
+          const out = [];
+          for (const item of list) {
+            const unprefixed = item && item.name ? fromNs(item.name) : null;
+            if (unprefixed !== null) out.push({ ...item, name: unprefixed });
+          }
+          return out;
+        };
+      }
+    }
+    if (typeof IDBDatabase !== 'undefined' && IDBDatabase.prototype) {
+      const nameDesc = Object.getOwnPropertyDescriptor(IDBDatabase.prototype, 'name');
+      if (nameDesc && typeof nameDesc.get === 'function') {
+        Object.defineProperty(IDBDatabase.prototype, 'name', {
+          ...nameDesc,
+          get() {
+            const raw = nameDesc.get.call(this);
+            const stripped = fromNs(raw);
+            return stripped !== null ? stripped : raw;
+          }
+        });
+      }
+    }
+  } catch {}
+
+  try {
+    if (typeof CacheStorage !== 'undefined' && CacheStorage.prototype) {
+      const origOpen = CacheStorage.prototype.open;
+      const origHas = CacheStorage.prototype.has;
+      const origDelete = CacheStorage.prototype.delete;
+      const origKeys = CacheStorage.prototype.keys;
+      const origMatch = CacheStorage.prototype.match;
+      if (typeof origOpen === 'function') {
+        CacheStorage.prototype.open = function(cacheName) {
+          return origOpen.call(this, toNs(cacheName));
+        };
+      }
+      if (typeof origHas === 'function') {
+        CacheStorage.prototype.has = function(cacheName) {
+          return origHas.call(this, toNs(cacheName));
+        };
+      }
+      if (typeof origDelete === 'function') {
+        CacheStorage.prototype.delete = function(cacheName) {
+          return origDelete.call(this, toNs(cacheName));
+        };
+      }
+      if (typeof origKeys === 'function') {
+        CacheStorage.prototype.keys = async function() {
+          const allKeys = await origKeys.call(this);
+          if (!Array.isArray(allKeys)) return [];
+          const out = [];
+          for (const k of allKeys) {
+            const unprefixed = fromNs(k);
+            if (unprefixed !== null) out.push(unprefixed);
+          }
+          return out;
+        };
+      }
+      if (typeof origMatch === 'function' && typeof origKeys === 'function' && typeof origOpen === 'function') {
+        CacheStorage.prototype.match = async function(request, options) {
+          if (options && options.cacheName) {
+            return origMatch.call(this, request, { ...options, cacheName: toNs(options.cacheName) });
+          }
+          const allKeys = await origKeys.call(this);
+          if (!Array.isArray(allKeys)) return undefined;
+          for (const rawKey of allKeys) {
+            if (fromNs(rawKey) !== null) {
+              const cache = await origOpen.call(this, rawKey);
+              const found = await cache.match(request, options);
+              if (found) return found;
+            }
+          }
+          return undefined;
+        };
+      }
+    }
+  } catch {}
+
+  try {
+    if (typeof BroadcastChannel === 'function') {
+      const OrigBroadcastChannel = BroadcastChannel;
+      const nameDesc = Object.getOwnPropertyDescriptor(OrigBroadcastChannel.prototype, 'name');
+      class ContainerBroadcastChannel extends OrigBroadcastChannel {
+        constructor(channelName) {
+          super(toNs(channelName));
+        }
+        get name() {
+          const raw = nameDesc && nameDesc.get ? nameDesc.get.call(this) : '';
+          const stripped = fromNs(raw);
+          return stripped !== null ? stripped : raw;
+        }
+      }
+      Object.defineProperty(window, 'BroadcastChannel', {
+        value: ContainerBroadcastChannel,
+        configurable: true,
+        writable: true
+      });
+    }
+  } catch {}
+
+  try {
+    if (typeof SharedWorker === 'function') {
+      const OrigSharedWorker = SharedWorker;
+      class ContainerSharedWorker extends OrigSharedWorker {
+        constructor(scriptURL, options) {
+          if (typeof options === 'string') {
+            super(scriptURL, toNs(options));
+          } else if (options && typeof options === 'object') {
+            super(scriptURL, { ...options, name: toNs(options.name || 'default') });
+          } else {
+            super(scriptURL, toNs('default'));
+          }
+        }
+      }
+      Object.defineProperty(window, 'SharedWorker', {
+        value: ContainerSharedWorker,
+        configurable: true,
+        writable: true
+      });
+    }
+  } catch {}
+
+  try {
+    if (typeof LockManager !== 'undefined' && LockManager.prototype) {
+      const origRequest = LockManager.prototype.request;
+      const origQuery = LockManager.prototype.query;
+      if (typeof origRequest === 'function') {
+        LockManager.prototype.request = function(name, ...rest) {
+          return origRequest.call(this, toNs(name), ...rest);
+        };
+      }
+      if (typeof origQuery === 'function') {
+        LockManager.prototype.query = async function() {
+          const snap = await origQuery.call(this);
+          if (!snap || typeof snap !== 'object') return snap;
+          const mapLocks = (arr) => Array.isArray(arr)
+            ? arr.filter(l => l && fromNs(l.name) !== null).map(l => ({ ...l, name: fromNs(l.name) }))
+            : [];
+          return {
+            held: mapLocks(snap.held),
+            pending: mapLocks(snap.pending)
+          };
+        };
+      }
+    }
+  } catch {}
+
+  try {
+    if (typeof StorageManager !== 'undefined' && StorageManager.prototype && typeof StorageManager.prototype.getDirectory === 'function') {
+      const origGetDir = StorageManager.prototype.getDirectory;
+      StorageManager.prototype.getDirectory = async function() {
+        const root = await origGetDir.call(this);
+        return root.getDirectoryHandle(nsPrefix.slice(0, -2), { create: true });
+      };
+    }
+  } catch {}
+
   try {
     if (navigator.serviceWorker) {
-      navigator.serviceWorker.register = () => Promise.reject(new DOMException('ServiceWorker disabled in ChromeTether Container Tab', 'SecurityError'));
+      const swErr = () => Promise.reject(new DOMException('ServiceWorker disabled in ChromeTether Container Tab', 'SecurityError'));
+      navigator.serviceWorker.register = swErr;
+      navigator.serviceWorker.getRegistration = () => Promise.resolve(undefined);
+      navigator.serviceWorker.getRegistrations = () => Promise.resolve([]);
+      try {
+        Object.defineProperty(navigator.serviceWorker, 'controller', { get: () => null, configurable: true });
+        Object.defineProperty(navigator.serviceWorker, 'ready', { get: () => new Promise(() => {}), configurable: true });
+      } catch {}
     }
   } catch {}
 })();`;
@@ -615,12 +963,18 @@ function syncLocalVaultToHub({ replace = false } = {}) {
     cookies: c.cookies,
     localStorage: c.localStorage
   }));
-  sendToHub({
-    type: 'ext_sync_containers',
-    containers,
-    replace,
-    deleted: Array.from(deletedContainerNames)
-  });
+  const deleted = Array.from(deletedContainerNames);
+  if (
+    sendToHub({
+      type: 'ext_sync_containers',
+      containers,
+      replace,
+      deleted
+    }) &&
+    deleted.length > 0
+  ) {
+    deletedContainerNames.clear();
+  }
 }
 
 async function reconcileTabsAndGroupsWithChrome() {
@@ -695,9 +1049,11 @@ async function reconcileTabsAndGroupsWithChrome() {
     }
     const now = Date.now();
     for (const [cName, entry] of Array.from(localVault.entries())) {
-      if (!activeContainerNames.has(cName) && now - (entry.createdAt || 0) > 60000) {
+      const hasData =
+        (Array.isArray(entry.cookies) && entry.cookies.length > 0) ||
+        Object.keys(entry.localStorage || {}).length > 0;
+      if (!activeContainerNames.has(cName) && !hasData && now - (entry.createdAt || 0) > 60000) {
         localVault.delete(cName);
-        deletedContainerNames.add(cName);
         changed = true;
       }
     }
@@ -792,13 +1148,19 @@ async function updateTabDnrSessionRules(tabId, newRules = []) {
   const numericTabId = Number(tabId);
   if (!Number.isInteger(numericTabId) || numericTabId <= 0) return;
 
-  const minId = numericTabId * 100;
+  const minId = getTabDnrBaseRuleId(numericTabId);
   const maxId = minId + 99;
+  const newRuleIds = new Set(newRules.map(r => r.id));
 
   try {
     const existing = await chrome.declarativeNetRequest.getSessionRules();
     const removeRuleIds = existing
-      .filter(r => r.id >= minId && r.id <= maxId)
+      .filter(
+        r =>
+          (r.id >= minId && r.id <= maxId) ||
+          newRuleIds.has(r.id) ||
+          (Array.isArray(r.condition?.tabIds) && r.condition.tabIds.includes(numericTabId))
+      )
       .map(r => r.id);
 
     await chrome.declarativeNetRequest.updateSessionRules({
@@ -1039,6 +1401,9 @@ async function createContainerTabLocal({
   color = 'blue',
   badge,
   initScript,
+  dnrRules: initialDnrRules,
+  cookies,
+  localStorage,
   fromHub = false
 }) {
   creatingTabCount++;
@@ -1056,7 +1421,11 @@ async function createContainerTabLocal({
 
   try {
     if (containerName) {
-      const entry = ensureContainerInLocalVault(containerName, color);
+      const entry = mergeHubContainerData(containerName, {
+        color,
+        cookies,
+        localStorage
+      });
       const info = {
         containerName: entry.name,
         color: entry.color,
@@ -1067,7 +1436,10 @@ async function createContainerTabLocal({
       tabContainers.set(tabId, info);
       await persistVaultAndTabs();
 
-      const dnrRules = buildDnrRulesForLocalContainerTab(entry.name, tabId);
+      const dnrRules =
+        Array.isArray(initialDnrRules) && initialDnrRules.length > 0
+          ? initialDnrRules
+          : buildDnrRulesForLocalContainerTab(entry.name, tabId);
       await updateTabDnrSessionRules(tabId, dnrRules);
       await placeTabInContainerGroup(
         tabId,
@@ -1249,8 +1621,11 @@ async function handleHubRequest(msg) {
       setTimeout(() => chrome.runtime.reload(), 50);
       return;
     } else if (action === 'update_tab_dnr_rules') {
-      const { tabId, rules, initScript } = params;
+      const { tabId, containerName: cName, rules, initScript, cookies, localStorage } = params;
       const numericTabId = Number(tabId);
+      if (cName && (Array.isArray(cookies) || (localStorage && typeof localStorage === 'object'))) {
+        mergeHubContainerData(cName, { cookies, localStorage });
+      }
       await updateTabDnrSessionRules(numericTabId, Array.isArray(rules) ? rules : []);
       if (initScript && tabContainers.has(numericTabId)) {
         const info = tabContainers.get(numericTabId);
@@ -1700,8 +2075,8 @@ async function connectHub() {
       sendToHub({ type: 'ping', ts: Date.now() });
     }, KEEPALIVE_INTERVAL_MS);
 
-    await restoreSessionState();
-    syncLocalVaultToHub({ replace: true });
+    await sessionRestorePromise;
+    syncLocalVaultToHub({ replace: false });
     await sendTabsSnapshot();
     broadcastPopupState();
   };
@@ -1711,17 +2086,19 @@ async function connectHub() {
       const msg = JSON.parse(String(event.data));
       if (msg.type === 'hub_hello') {
         if (msg.token) hubToken = msg.token;
-        if (Array.isArray(msg.containers)) {
-          for (const c of msg.containers) {
-            if (!c?.name) continue;
-            const clean = normalizeName(c.name);
-            if (deletedContainerNames.has(clean)) continue;
-            ensureContainerInLocalVault(clean, c.color);
+        sessionRestorePromise.then(() => {
+          if (Array.isArray(msg.containers)) {
+            for (const c of msg.containers) {
+              if (!c?.name) continue;
+              const clean = normalizeName(c.name);
+              if (deletedContainerNames.has(clean)) continue;
+              mergeHubContainerData(clean, c);
+            }
+            persistVaultAndTabs();
           }
-          persistVaultAndTabs();
-        }
-        syncLocalVaultToHub({ replace: true });
-        broadcastPopupState();
+          syncLocalVaultToHub({ replace: false });
+          broadcastPopupState();
+        });
         return;
       }
       if (msg.type === 'ping') {
@@ -1757,7 +2134,7 @@ async function connectHub() {
   };
 }
 
-function scheduleReconnect(delayMs = 4000) {
+function scheduleReconnect(delayMs = 1000) {
   if (reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
@@ -1838,4 +2215,5 @@ chrome.alarms.onAlarm.addListener(alarm => {
   }
 });
 
-restoreSessionState().then(() => connectHub());
+const sessionRestorePromise = restoreSessionState();
+sessionRestorePromise.then(() => connectHub());

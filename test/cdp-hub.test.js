@@ -353,6 +353,28 @@ test('CdpHubServer + simulated Extension creates same-window Container Tabs, cap
       hijack: 'spoofed'
     });
 
+    // Attach to page-11 (acc-1) and verify CDP Network.getCookies / Network.setCookie / Storage.getCookies
+    // are isolated per container vault rather than leaking to Chrome's default CookieJar
+    const attachAcc1 = await rpc.send('Target.attachToTarget', {
+      targetId: 'page-11',
+      flatten: true
+    });
+    const acc1Session = attachAcc1.sessionId;
+    const getCookiesRes = await rpc.send(
+      'Network.getCookies',
+      { urls: ['https://portal.example.com/dashboard'] },
+      acc1Session
+    );
+    assert.equal(getCookiesRes.cookies.length, 1);
+    assert.equal(getCookiesRes.cookies[0].name, 'session');
+    assert.equal(getCookiesRes.cookies[0].value, 'acc1_live_token');
+
+    // Verify Storage.getCookies on acc-2's browserContextId returns empty (no bleed from acc-1)
+    const acc2CookiesRes = await rpc.send('Storage.getCookies', {
+      browserContextId: 'tether-ctx-acc-2'
+    });
+    assert.deepEqual(acc2CookiesRes.cookies, []);
+
     mcpWs.close();
     extWs.close();
   } finally {

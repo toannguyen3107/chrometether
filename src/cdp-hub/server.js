@@ -6,6 +6,7 @@ import {
   ContainerVault,
   extractUrlContainerHint,
   fromVirtualContextId,
+  getTabDnrSlotId,
   normalizeContainerName
 } from './container-vault.js';
 import {
@@ -127,6 +128,8 @@ export class CdpHubServer {
       : null;
     this._extReqSeq = 0;
     this._extPending = new Map();
+    this._extWaiters = [];
+    this.startedAt = 0;
 
     // Phase 0 Direct-CDP upstream browser WebSocket (DevToolsActivePort)
     this.directWs = null;
@@ -176,6 +179,7 @@ export class CdpHubServer {
       });
     });
 
+    this.startedAt = Date.now();
     const addr = this.httpServer.address();
     if (addr && typeof addr === 'object') {
       this.port = addr.port;
@@ -594,6 +598,7 @@ export class CdpHubServer {
         detachedFailClosed: false,
         mainFrameId: `main-frame-${key}`,
         executionContexts: new Map(),
+        requestUrls: new Map(),
         frameTree: null,
         domainRefCounts: {
           Runtime: new Set(),
@@ -676,14 +681,38 @@ export class CdpHubServer {
       }
     });
 
-    // Send initial hello with current container vault state (never expose the /cdp Bearer token over /ext)
+    // Send initial hello with full container vault state including cookies & localStorage
+    // (never expose the /cdp Bearer token over /ext)
     ws.send(
       JSON.stringify({
         type: 'hub_hello',
         version: HUB_VERSION,
-        containers: this.vault.listContainers()
+        containers: this.vault.exportContainersSnapshot()
       })
     );
+
+    if (this._extWaiters.length > 0) {
+      const waiters = this._extWaiters.splice(0, this._extWaiters.length);
+      for (const resolve of waiters) resolve(true);
+    }
+  }
+
+  _waitForExtensionConnection(timeoutMs = 2500) {
+    if (this.extSocket && this.extSocket.readyState === WS_STATE.OPEN) {
+      return Promise.resolve(true);
+    }
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        const idx = this._extWaiters.indexOf(onReady);
+        if (idx !== -1) this._extWaiters.splice(idx, 1);
+        resolve(false);
+      }, timeoutMs);
+      const onReady = ok => {
+        clearTimeout(timer);
+        resolve(Boolean(ok));
+      };
+      this._extWaiters.push(onReady);
+    });
   }
 
   _sendExtensionRequest(action, params = {}, timeoutMs = 10000) {
@@ -772,32 +801,8 @@ export class CdpHubServer {
       }
       for (const c of msg.containers) {
         if (!c?.name) continue;
-        const entry = this.vault.ensureContainer(c.name, { color: c.color });
-        if (Array.isArray(c.cookies)) {
-          for (const cookie of c.cookies) {
-            if (!cookie?.name || !cookie?.domain) continue;
-            const exists = entry.cookies.some(
-              existing =>
-                existing.name === cookie.name &&
-                existing.domain === cookie.domain &&
-                existing.path === (cookie.path || '/')
-            );
-            if (!exists) {
-              entry.cookies.push(cookie);
-              vaultChanged = true;
-            }
-          }
-        }
-        if (c.localStorage && typeof c.localStorage === 'object') {
-          for (const [origin, bucket] of Object.entries(c.localStorage)) {
-            if (bucket && typeof bucket === 'object') {
-              entry.localStorage[origin] = {
-                ...(entry.localStorage[origin] || {}),
-                ...bucket
-              };
-              vaultChanged = true;
-            }
-          }
+        if (this.vault.mergeContainerData(c.name, c)) {
+          vaultChanged = true;
         }
       }
       if (vaultChanged && this.vault.autoSave) {
@@ -934,7 +939,7 @@ export class CdpHubServer {
     for (const tab of Array.from(this.tabs.values())) {
       if (tab.containerName === name) {
         if (closeTabs) {
-          if (this.extSocket?.readyState === WS_STATE.OPEN && !tab.upstreamTargetId) {
+          if (!notifyExtension && this.extSocket?.readyState === WS_STATE.OPEN && !tab.upstreamTargetId) {
             await this._sendExtensionRequest('close_tab', {
               tabId: Number(tab.tabId)
             }).catch(() => {});
@@ -959,7 +964,7 @@ export class CdpHubServer {
           containerName: name,
           closeTabs
         },
-        1500
+        1200
       ).catch(() => {});
     }
     return deleted;
@@ -1036,12 +1041,23 @@ export class CdpHubServer {
     const rules = this.vault.buildDnrSessionRulesForTab(tab.containerName, numericTabId, {
       failClosedBlocked
     });
+    const entry = this.vault.getContainer(tab.containerName);
+    const slotId = getTabDnrSlotId(numericTabId);
     try {
+      if (slotId > 0 && slotId !== numericTabId) {
+        // Ensure backward-compatibility if an unpatched Extension Service Worker is still loaded in Chrome memory
+        await this._sendExtensionRequest('update_tab_dnr_rules', {
+          tabId: slotId,
+          rules: []
+        }).catch(() => {});
+      }
       await this._sendExtensionRequest('update_tab_dnr_rules', {
         tabId: numericTabId,
         containerName: tab.containerName,
         rules,
-        initScript
+        initScript,
+        cookies: entry ? entry.cookies : undefined,
+        localStorage: entry ? entry.localStorage : undefined
       });
     } catch {
       // ignore if extension is reconnecting
@@ -1227,23 +1243,35 @@ export class CdpHubServer {
       ? this.vault.ensureContainer(effectiveContainerName)
       : null;
 
+    if (
+      container &&
+      (!this.extSocket || this.extSocket.readyState !== WS_STATE.OPEN) &&
+      !this.upstreamWsUrl &&
+      this.autoConnectDirectCdp &&
+      Date.now() - (this.startedAt || 0) < 5000
+    ) {
+      await this._waitForExtensionConnection(2500);
+    }
+
     if (this.extSocket && this.extSocket.readyState === WS_STATE.OPEN) {
       const initScript = container ? this.vault.buildInitScript(container.name) : null;
       this._pendingCreateTabCount = (this._pendingCreateTabCount || 0) + 1;
       let tab;
       try {
         const res = await this._sendExtensionRequest('create_tab', {
-          url: targetUrl,
+          url: container ? 'about:blank' : targetUrl,
           background,
           containerName: container ? container.name : null,
           color: container ? container.color : null,
           badge: container ? container.badge : null,
-          initScript
+          initScript,
+          cookies: container ? container.cookies : undefined,
+          localStorage: container ? container.localStorage : undefined
         });
         tab = this._ensureTabRecord({
           tabId: res.tabId,
-          url: res.url || targetUrl,
-          title: res.title || targetUrl,
+          url: targetUrl,
+          title: res.title && res.title !== 'about:blank' ? res.title : targetUrl,
           windowId: res.windowId || 1,
           containerName: container ? container.name : null
         });
@@ -1252,6 +1280,9 @@ export class CdpHubServer {
       }
       if (container) {
         await this._syncTabDnrRules(tab);
+        if (targetUrl && targetUrl !== 'about:blank') {
+          await this._forwardTabCdpCommand(tab, 'Page.navigate', { url: targetUrl }).catch(() => {});
+        }
       }
       this._broadcastNewTabToMcpClients(tab);
       return tab;
@@ -1503,6 +1534,16 @@ export class CdpHubServer {
       return;
     }
 
+    if (method === 'Network.requestWillBeSent' && params.requestId && params.request?.url) {
+      if (tab.requestUrls.size > 500) {
+        const oldestKey = tab.requestUrls.keys().next().value;
+        tab.requestUrls.delete(oldestKey);
+      }
+      tab.requestUrls.set(params.requestId, params.request.url);
+    } else if (method === 'Network.responseReceived' && params.requestId && params.response?.url) {
+      tab.requestUrls.set(params.requestId, params.response.url);
+    }
+
     // Capture raw Set-Cookie headers from Network.responseReceivedExtraInfo into Vault
     if (method === 'Network.responseReceivedExtraInfo' && tab.containerName && params.headers) {
       const rawSetCookie =
@@ -1515,7 +1556,8 @@ export class CdpHubServer {
           .map(s => s.trim())
           .filter(Boolean);
         if (list.length > 0) {
-          const changed = this.vault.applySetCookieHeaders(tab.containerName, list, tab.url);
+          const reqUrl = (params.requestId && tab.requestUrls.get(params.requestId)) || tab.url;
+          const changed = this.vault.applySetCookieHeaders(tab.containerName, list, reqUrl);
           if (changed) {
             this._syncContainerDnrRules(tab.containerName).catch(() => {});
           }
@@ -2042,6 +2084,45 @@ export class CdpHubServer {
       return;
     }
 
+    if (method === 'Storage.getCookies') {
+      const ctxContainer = params.browserContextId
+        ? this.vault.getContainerByContextId(params.browserContextId)
+        : null;
+      if (ctxContainer) {
+        this._sendMcpResponse(client, id, {
+          cookies: this.vault.getCdpCookies(ctxContainer.name)
+        });
+        return;
+      }
+    }
+
+    if (method === 'Storage.setCookies') {
+      const ctxContainer = params.browserContextId
+        ? this.vault.getContainerByContextId(params.browserContextId)
+        : null;
+      if (ctxContainer && Array.isArray(params.cookies)) {
+        for (const c of params.cookies) {
+          this.vault.setCdpCookie(ctxContainer.name, c);
+        }
+        await this._syncContainerDnrRules(ctxContainer.name);
+        this._sendMcpResponse(client, id, {});
+        return;
+      }
+    }
+
+    if (method === 'Storage.clearCookies') {
+      const ctxContainer = params.browserContextId
+        ? this.vault.getContainerByContextId(params.browserContextId)
+        : null;
+      if (ctxContainer) {
+        ctxContainer.cookies = [];
+        if (this.vault.autoSave) this.vault.save();
+        await this._syncContainerDnrRules(ctxContainer.name);
+        this._sendMcpResponse(client, id, {});
+        return;
+      }
+    }
+
     this._sendMcpResponse(client, id, {});
   }
 
@@ -2139,6 +2220,82 @@ export class CdpHubServer {
     if (method === 'Target.setAutoAttach' || method === 'Runtime.runIfWaitingForDebugger') {
       this._sendMcpResponse(client, id, {}, sessionId);
       return;
+    }
+
+    const targetContainer =
+      tab.containerName ||
+      (params?.browserContextId
+        ? this.vault.getContainerByContextId(params.browserContextId)?.name
+        : null);
+
+    if (targetContainer) {
+      if (method === 'Network.getCookies') {
+        const urls =
+          Array.isArray(params?.urls) && params.urls.length > 0
+            ? params.urls
+            : tab.url && tab.url !== 'about:blank'
+              ? [tab.url]
+              : null;
+        this._sendMcpResponse(
+          client,
+          id,
+          { cookies: this.vault.getCdpCookies(targetContainer, urls) },
+          sessionId
+        );
+        return;
+      }
+      if (method === 'Network.getAllCookies' || method === 'Storage.getCookies') {
+        this._sendMcpResponse(
+          client,
+          id,
+          { cookies: this.vault.getCdpCookies(targetContainer, null) },
+          sessionId
+        );
+        return;
+      }
+      if (method === 'Network.setCookie') {
+        const success = this.vault.setCdpCookie(targetContainer, {
+          url: tab.url && tab.url !== 'about:blank' ? tab.url : undefined,
+          ...params
+        });
+        if (success) {
+          await this._syncContainerDnrRules(targetContainer);
+        }
+        this._sendMcpResponse(client, id, { success }, sessionId);
+        return;
+      }
+      if (method === 'Network.setCookies' || method === 'Storage.setCookies') {
+        if (Array.isArray(params?.cookies)) {
+          for (const c of params.cookies) {
+            this.vault.setCdpCookie(targetContainer, {
+              url: tab.url && tab.url !== 'about:blank' ? tab.url : undefined,
+              ...c
+            });
+          }
+          await this._syncContainerDnrRules(targetContainer);
+        }
+        this._sendMcpResponse(client, id, {}, sessionId);
+        return;
+      }
+      if (method === 'Network.deleteCookies') {
+        this.vault.deleteCdpCookies(targetContainer, {
+          url: tab.url && tab.url !== 'about:blank' ? tab.url : undefined,
+          ...params
+        });
+        await this._syncContainerDnrRules(targetContainer);
+        this._sendMcpResponse(client, id, {}, sessionId);
+        return;
+      }
+      if (method === 'Network.clearBrowserCookies' || method === 'Storage.clearCookies') {
+        const entry = this.vault.getContainer(targetContainer);
+        if (entry) {
+          entry.cookies = [];
+          if (this.vault.autoSave) this.vault.save();
+          await this._syncContainerDnrRules(targetContainer);
+        }
+        this._sendMcpResponse(client, id, {}, sessionId);
+        return;
+      }
     }
 
     if (method === 'Page.bringToFront') {
